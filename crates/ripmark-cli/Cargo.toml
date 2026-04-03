@@ -1,0 +1,16 @@
+[package]
+name    = "ripmark"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ripmark"
+path = "src/main.rs"
+
+[dependencies]
+ripmark-core = { path = "../ripmark-core" }
+clap         = { workspace = true }
+anyhow       = { workspace = true }
+indicatif    = { workspace = true }
+serde_json   = { workspace = true }
+image        = { workspace = true }

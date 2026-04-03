@@ -1,0 +1,16 @@
+[package]
+name    = "ripmark-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rustfft        = { workspace = true }
+ndarray        = { workspace = true }
+ndarray-linalg = { workspace = true }
+image          = { workspace = true }
+rayon          = { workspace = true }
+serde          = { workspace = true }
+serde_json     = { workspace = true }
+bincode        = { workspace = true }
+thiserror      = { workspace = true }
+anyhow         = { workspace = true }
