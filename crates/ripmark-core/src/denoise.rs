@@ -29,7 +29,10 @@ pub fn wiener_channel(channel: ArrayView2<f32>) -> Array2<f32> {
         c * ratio
     });
 
-    Spectrum { data: filtered_data }.to_spatial()
+    Spectrum {
+        data: filtered_data,
+    }
+    .to_spatial()
 }
 
 /// Denoise each RGB channel independently with the Wiener filter.
@@ -38,7 +41,8 @@ pub fn wiener_rgb(image: ArrayView3<f32>) -> Array3<f32> {
     let w = image.shape()[1];
     let mut out = Array3::<f32>::zeros((h, w, 3));
     for c in 0..3 {
-        out.slice_mut(s![.., .., c]).assign(&wiener_channel(image.slice(s![.., .., c])));
+        out.slice_mut(s![.., .., c])
+            .assign(&wiener_channel(image.slice(s![.., .., c])));
     }
     out
 }
@@ -92,8 +96,12 @@ fn haar2d_forward(img: ArrayView2<f32>) -> (Array2<f32>, usize, usize) {
     for r in 0..h {
         let row: Vec<f32> = img.slice(s![r, ..]).to_vec();
         let (a, d) = haar1d_forward(&row);
-        for (c, &v) in a.iter().enumerate() { temp[[r, c]]      = v; }
-        for (c, &v) in d.iter().enumerate() { temp[[r, c + hw]] = v; }
+        for (c, &v) in a.iter().enumerate() {
+            temp[[r, c]] = v;
+        }
+        for (c, &v) in d.iter().enumerate() {
+            temp[[r, c + hw]] = v;
+        }
     }
 
     let mut result = Array2::<f32>::zeros((h, w));
@@ -101,8 +109,12 @@ fn haar2d_forward(img: ArrayView2<f32>) -> (Array2<f32>, usize, usize) {
     for c in 0..w {
         let col: Vec<f32> = temp.slice(s![.., c]).to_vec();
         let (a, d) = haar1d_forward(&col);
-        for (r, &v) in a.iter().enumerate() { result[[r,      c]] = v; }
-        for (r, &v) in d.iter().enumerate() { result[[r + hh, c]] = v; }
+        for (r, &v) in a.iter().enumerate() {
+            result[[r, c]] = v;
+        }
+        for (r, &v) in d.iter().enumerate() {
+            result[[r + hh, c]] = v;
+        }
     }
 
     (result, hh, hw)
@@ -120,7 +132,9 @@ fn haar2d_inverse(coeffs: &Array2<f32>, hh: usize, hw: usize) -> Array2<f32> {
         let detail: Vec<f32> = coeffs.slice(s![hh.., c]).to_vec();
         let rec = haar1d_inverse(&approx, &detail);
         for (r, v) in rec.into_iter().enumerate() {
-            if r < h { temp[[r, c]] = v; }
+            if r < h {
+                temp[[r, c]] = v;
+            }
         }
     }
 
@@ -131,7 +145,9 @@ fn haar2d_inverse(coeffs: &Array2<f32>, hh: usize, hw: usize) -> Array2<f32> {
         let detail: Vec<f32> = temp.slice(s![r, hw..]).to_vec();
         let rec = haar1d_inverse(&approx, &detail);
         for (c, v) in rec.into_iter().enumerate() {
-            if c < w { result[[r, c]] = v; }
+            if c < w {
+                result[[r, c]] = v;
+            }
         }
     }
 
@@ -141,7 +157,11 @@ fn haar2d_inverse(coeffs: &Array2<f32>, hh: usize, hw: usize) -> Array2<f32> {
 #[inline]
 fn soft_threshold(x: f32, lambda: f32) -> f32 {
     let ax = x.abs();
-    if ax <= lambda { 0.0 } else { x.signum() * (ax - lambda) }
+    if ax <= lambda {
+        0.0
+    } else {
+        x.signum() * (ax - lambda)
+    }
 }
 
 /// Denoise a single grayscale channel using Haar wavelet soft-thresholding.
@@ -157,7 +177,9 @@ pub fn wavelet_channel(channel: ArrayView2<f32>, levels: usize) -> Array2<f32> {
     for _ in 0..levels {
         let h = coeffs.nrows();
         let w = coeffs.ncols();
-        if h < 4 || w < 4 { break; }
+        if h < 4 || w < 4 {
+            break;
+        }
 
         let ll_view = coeffs.slice(s![..h, ..w]).to_owned();
         let (new_coeffs, hh, hw) = haar2d_forward(ll_view.view());
@@ -180,9 +202,21 @@ pub fn wavelet_channel(channel: ArrayView2<f32>, levels: usize) -> Array2<f32> {
     let threshold = sigma * (2.0_f32 * n.ln()).sqrt();
 
     for &(hh, hw, h, w) in &level_meta {
-        for r in 0..hh { for c in hw..w { coeffs[[r, c]] = soft_threshold(coeffs[[r, c]], threshold); } }
-        for r in hh..h { for c in 0..hw { coeffs[[r, c]] = soft_threshold(coeffs[[r, c]], threshold); } }
-        for r in hh..h { for c in hw..w { coeffs[[r, c]] = soft_threshold(coeffs[[r, c]], threshold); } }
+        for r in 0..hh {
+            for c in hw..w {
+                coeffs[[r, c]] = soft_threshold(coeffs[[r, c]], threshold);
+            }
+        }
+        for r in hh..h {
+            for c in 0..hw {
+                coeffs[[r, c]] = soft_threshold(coeffs[[r, c]], threshold);
+            }
+        }
+        for r in hh..h {
+            for c in hw..w {
+                coeffs[[r, c]] = soft_threshold(coeffs[[r, c]], threshold);
+            }
+        }
     }
 
     for &(hh, hw, h, w) in level_meta.iter().rev() {
@@ -210,16 +244,15 @@ pub fn wavelet_rgb(image: ArrayView3<f32>, levels: usize) -> Array3<f32> {
 /// Returns image - denoised. The watermark signal concentrates in this residual.
 pub fn extract_noise_fused(image: ArrayView3<f32>) -> Array3<f32> {
     const W_WAVELET: f32 = 1.0;
-    const W_WIENER:  f32 = 0.6;
-    const TOTAL: f32     = W_WAVELET + W_WIENER;
+    const W_WIENER: f32 = 0.6;
+    const TOTAL: f32 = W_WAVELET + W_WIENER;
 
     let denoised_wav = wavelet_rgb(image, 3);
     let denoised_wie = wiener_rgb(image);
 
     Array3::from_shape_fn(image.dim(), |(r, c, ch)| {
-        let fused = (denoised_wav[[r, c, ch]] * W_WAVELET
-            + denoised_wie[[r, c, ch]] * W_WIENER)
-            / TOTAL;
+        let fused =
+            (denoised_wav[[r, c, ch]] * W_WAVELET + denoised_wie[[r, c, ch]] * W_WIENER) / TOTAL;
         image[[r, c, ch]] - fused
     })
 }
@@ -233,11 +266,17 @@ pub fn extract_noise_wavelet(image: ArrayView3<f32>, levels: usize) -> Array3<f3
 }
 
 fn median_f32(data: &[f32]) -> f32 {
-    if data.is_empty() { return 0.0; }
+    if data.is_empty() {
+        return 0.0;
+    }
     let mut sorted = data.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let mid = sorted.len() / 2;
-    if sorted.len() % 2 == 1 { sorted[mid] } else { (sorted[mid - 1] + sorted[mid]) * 0.5 }
+    if sorted.len() % 2 == 1 {
+        sorted[mid]
+    } else {
+        (sorted[mid - 1] + sorted[mid]) * 0.5
+    }
 }
 
 #[cfg(test)]
@@ -249,10 +288,15 @@ mod tests {
     fn wiener_preserves_smooth_image() {
         let img = Array2::from_shape_fn((32, 32), |(r, c)| ((r + c) as f32 / 64.0).min(1.0));
         let denoised = wiener_channel(img.view());
-        let max_err = img.iter().zip(denoised.iter())
+        let max_err = img
+            .iter()
+            .zip(denoised.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f32, f32::max);
-        assert!(max_err < 0.2, "Wiener distorted smooth image: max_err={max_err}");
+        assert!(
+            max_err < 0.2,
+            "Wiener distorted smooth image: max_err={max_err}"
+        );
     }
 
     #[test]
@@ -273,8 +317,11 @@ mod tests {
         let w = coeffs.ncols();
         for r in hh..h {
             for c in hw..w {
-                assert!(coeffs[[r, c]].abs() < 1e-6,
-                    "Expected zero detail, got {}", coeffs[[r, c]]);
+                assert!(
+                    coeffs[[r, c]].abs() < 1e-6,
+                    "Expected zero detail, got {}",
+                    coeffs[[r, c]]
+                );
             }
         }
     }
@@ -286,7 +333,10 @@ mod tests {
         });
         let noise = extract_noise_fused(img.view());
         let rms = (noise.iter().map(|&v| v * v).sum::<f32>() / noise.len() as f32).sqrt();
-        assert!(rms < 0.05, "Noise residual too large for smooth image: rms={rms}");
+        assert!(
+            rms < 0.05,
+            "Noise residual too large for smooth image: rms={rms}"
+        );
     }
 
     #[test]

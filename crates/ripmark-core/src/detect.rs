@@ -55,11 +55,7 @@ pub fn detect(image: ArrayView3<f32>, codebook: &Codebook) -> DetectionResult {
     let size = codebook.image_size;
     let center = size as i32 / 2;
 
-    let resized = resize_rgb(
-        &image.to_owned(),
-        size,
-        size,
-    );
+    let resized = resize_rgb(&image.to_owned(), size, size);
 
     // Compute shifted FFT of grayscale for phase extraction.
     let gray = to_grayscale(resized.view());
@@ -67,8 +63,20 @@ pub fn detect(image: ArrayView3<f32>, codebook: &Codebook) -> DetectionResult {
     let img_phase = spectrum.mapv(|c| c.arg());
 
     // Phase match for each carrier set.
-    let dark_phase_match  = phase_match(&img_phase, CARRIERS_DARK,  &codebook.dark.ref_phases,  center, size);
-    let white_phase_match = phase_match(&img_phase, CARRIERS_WHITE, &codebook.white.ref_phases, center, size);
+    let dark_phase_match = phase_match(
+        &img_phase,
+        CARRIERS_DARK,
+        &codebook.dark.ref_phases,
+        center,
+        size,
+    );
+    let white_phase_match = phase_match(
+        &img_phase,
+        CARRIERS_WHITE,
+        &codebook.white.ref_phases,
+        center,
+        size,
+    );
 
     let (best_phase_match, best_set) = if dark_phase_match >= white_phase_match {
         (dark_phase_match, BestSet::Dark)
@@ -83,7 +91,7 @@ pub fn detect(image: ArrayView3<f32>, codebook: &Codebook) -> DetectionResult {
     // Threshold 0.78 sits between max non-watermarked (0.71) and min watermarked (0.92).
     let phase_score = sigmoid(20.0 * (best_phase_match - 0.78));
     // CVR threshold 2.0 separates watermarked from non-watermarked noise ratios.
-    let cvr_score   = sigmoid(2.0 * (cvr_ratio - 2.0));
+    let cvr_score = sigmoid(2.0 * (cvr_ratio - 2.0));
 
     let confidence = (0.80 * phase_score + 0.20 * cvr_score).min(1.0);
 
@@ -152,7 +160,11 @@ fn carrier_to_random_ratio(
         .filter_map(|&(fy, fx)| {
             let y = (fy + center) as usize;
             let x = (fx + center) as usize;
-            if y < size && x < size { Some(noise_mag[[y, x]]) } else { None }
+            if y < size && x < size {
+                Some(noise_mag[[y, x]])
+            } else {
+                None
+            }
         })
         .collect();
 
@@ -163,9 +175,13 @@ fn carrier_to_random_ratio(
         .collect();
 
     let mean_carrier = mean(&carrier_mags);
-    let mean_random  = mean(&random_mags);
+    let mean_random = mean(&random_mags);
 
-    if mean_random < 1e-10 { 0.0 } else { mean_carrier / mean_random }
+    if mean_random < 1e-10 {
+        0.0
+    } else {
+        mean_carrier / mean_random
+    }
 }
 
 // Generate random (y, x) bin positions away from DC, deterministically.
@@ -182,7 +198,9 @@ fn random_bins(size: usize, n: usize) -> Vec<(usize, usize)> {
         let ry = 10 + (state >> 32) as usize % (size - 20);
         let rx = 10 + (state & 0xffffffff) as usize % (size - 20);
         // Skip DC neighbourhood.
-        if ry.abs_diff(center) < 5 && rx.abs_diff(center) < 5 { continue; }
+        if ry.abs_diff(center) < 5 && rx.abs_diff(center) < 5 {
+            continue;
+        }
         bins.push((ry, rx));
     }
     bins
@@ -193,15 +211,17 @@ fn sigmoid(x: f32) -> f32 {
 }
 
 fn mean(values: &[f32]) -> f32 {
-    if values.is_empty() { return 0.0; }
+    if values.is_empty() {
+        return 0.0;
+    }
     values.iter().sum::<f32>() / values.len() as f32
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::Array3;
     use crate::codebook::Codebook;
+    use ndarray::Array3;
 
     fn dummy_codebook(size: usize) -> Codebook {
         let images: Vec<Array3<f32>> = (0..8)
@@ -230,14 +250,20 @@ mod tests {
     fn phase_score_above_threshold_gives_high_confidence() {
         // A phase match of 0.95 (well into watermarked range) should score high.
         let score = sigmoid(20.0 * (0.95_f32 - 0.78));
-        assert!(score > 0.96, "expected high score for 0.95 match, got {score}");
+        assert!(
+            score > 0.96,
+            "expected high score for 0.95 match, got {score}"
+        );
     }
 
     #[test]
     fn phase_score_below_threshold_gives_low_confidence() {
         // A phase match of 0.60 (non-watermarked range) should score low.
         let score = sigmoid(20.0 * (0.60_f32 - 0.78));
-        assert!(score < 0.03, "expected low score for 0.60 match, got {score}");
+        assert!(
+            score < 0.03,
+            "expected low score for 0.60 match, got {score}"
+        );
     }
 
     #[test]

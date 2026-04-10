@@ -1128,7 +1128,9 @@ dependencies = [
  "clap",
  "image",
  "indicatif",
+ "ndarray",
  "ripmark-core",
+ "serde",
  "serde_json",
 ]
 

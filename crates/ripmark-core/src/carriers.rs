@@ -12,30 +12,76 @@ use crate::fft::{fft2, fftshift, resize_gray, to_grayscale};
 /// Dark-image carriers: diagonal grid pattern.
 /// Extracted from black and nb_pro Gemini images at 512x512.
 pub const CARRIERS_DARK: &[(i32, i32)] = &[
-    (-5, -3), (5,  3), (-5,  3), (5, -3),
-    (-3, -4), (3,  4), (-3,  4), (3, -4),
-    (-4, -3), (4,  3), (-4,  3), (4, -3),
-    (-5, -1), (5,  1), (-5,  1), (5, -1),
-    (-5, -2), (5,  2), (-5,  2), (5, -2),
-    (-2, -5), (2,  5), (-2,  5), (2, -5),
-    (-1, -5), (1,  5), (-1,  5), (1, -5),
-    (-4, -4), (4,  4), (-4,  4), (4, -4),
-    (-1, -6), (1,  6), (-3, -5), (3,  5),
+    (-5, -3),
+    (5, 3),
+    (-5, 3),
+    (5, -3),
+    (-3, -4),
+    (3, 4),
+    (-3, 4),
+    (3, -4),
+    (-4, -3),
+    (4, 3),
+    (-4, 3),
+    (4, -3),
+    (-5, -1),
+    (5, 1),
+    (-5, 1),
+    (5, -1),
+    (-5, -2),
+    (5, 2),
+    (-5, 2),
+    (5, -2),
+    (-2, -5),
+    (2, 5),
+    (-2, 5),
+    (2, -5),
+    (-1, -5),
+    (1, 5),
+    (-1, 5),
+    (1, -5),
+    (-4, -4),
+    (4, 4),
+    (-4, 4),
+    (4, -4),
+    (-1, -6),
+    (1, 6),
+    (-3, -5),
+    (3, 5),
 ];
 
 /// White-image carriers: horizontal axis.
 /// Extracted from white Gemini images at 512x512.
 pub const CARRIERS_WHITE: &[(i32, i32)] = &[
-    (0, -7),  (0,  7),  (0, -8),  (0,  8),
-    (0, -9),  (0,  9),  (0, -10), (0, 10),
-    (0, -11), (0, 11),  (0, -12), (0, 12),
-    (0, -20), (0, 20),  (0, -21), (0, 21),
-    (0, -22), (0, 22),  (0, -23), (0, 23),
+    (0, -7),
+    (0, 7),
+    (0, -8),
+    (0, 8),
+    (0, -9),
+    (0, 9),
+    (0, -10),
+    (0, 10),
+    (0, -11),
+    (0, 11),
+    (0, -12),
+    (0, 12),
+    (0, -20),
+    (0, 20),
+    (0, -21),
+    (0, 21),
+    (0, -22),
+    (0, 22),
+    (0, -23),
+    (0, 23),
 ];
 
 /// Union of both carrier sets (used when image type is unknown).
 pub fn all_carriers() -> Vec<(i32, i32)> {
-    CARRIERS_DARK.iter().chain(CARRIERS_WHITE.iter()).copied().collect()
+    CARRIERS_DARK
+        .iter()
+        .chain(CARRIERS_WHITE.iter())
+        .copied()
+        .collect()
 }
 
 /// Which carrier set an image belongs to.
@@ -78,7 +124,9 @@ pub fn phase_coherence_at(
     size: usize,
 ) -> Vec<f32> {
     let n = images.len();
-    if n == 0 { return vec![0.0; carriers.len()]; }
+    if n == 0 {
+        return vec![0.0; carriers.len()];
+    }
 
     let mut phase_sum: Vec<Complex<f32>> = vec![Complex::new(0.0, 0.0); carriers.len()];
     let center = size as i32 / 2;
@@ -108,7 +156,9 @@ pub fn reference_phases(
     size: usize,
 ) -> Vec<f32> {
     let n = images.len();
-    if n == 0 { return vec![0.0; carriers.len()]; }
+    if n == 0 {
+        return vec![0.0; carriers.len()];
+    }
 
     let mut phase_sum: Vec<Complex<f32>> = vec![Complex::new(0.0, 0.0); carriers.len()];
     let center = size as i32 / 2;
@@ -140,9 +190,11 @@ pub fn detect_carriers_at_scale(
     n_carriers: usize,
 ) -> Vec<CarrierInfo> {
     let n = images.len();
-    if n == 0 { return vec![]; }
+    if n == 0 {
+        return vec![];
+    }
 
-    let mut mag_sum   = Array2::<f32>::zeros((size, size));
+    let mut mag_sum = Array2::<f32>::zeros((size, size));
     let mut phase_vec = Array2::<Complex<f32>>::zeros((size, size));
 
     for img in images {
@@ -151,13 +203,13 @@ pub fn detect_carriers_at_scale(
         let spectrum_shifted = fftshift(fft2(gray_rs.view()).data);
 
         for ((r, c), v) in spectrum_shifted.indexed_iter() {
-            mag_sum[[r, c]]   += v.norm();
+            mag_sum[[r, c]] += v.norm();
             let phi = v.arg();
             phase_vec[[r, c]] += Complex::new(phi.cos(), phi.sin());
         }
     }
 
-    let avg_mag   = mag_sum.mapv(|v| v / n as f32);
+    let avg_mag = mag_sum.mapv(|v| v / n as f32);
     let coherence = phase_vec.mapv(|v| v.norm() / n as f32);
     let avg_phase = phase_vec.mapv(|v| v.arg());
 
@@ -220,7 +272,10 @@ pub fn detect_carriers(
             let nfy = (c.freq.0 as f64 * BASE_SCALE as f64 / scale as f64).round() as i32;
             let nfx = (c.freq.1 as f64 * BASE_SCALE as f64 / scale as f64).round() as i32;
             let key = ((nfy / BIN) * BIN, (nfx / BIN) * BIN);
-            vote_map.entry(key).or_default().push(CarrierInfo { freq: (nfy, nfx), ..c });
+            vote_map.entry(key).or_default().push(CarrierInfo {
+                freq: (nfy, nfx),
+                ..c
+            });
         }
     }
 
@@ -228,23 +283,25 @@ pub fn detect_carriers(
         .into_values()
         .map(|entries| {
             let votes = entries.len() as u32;
-            let avg = |f: fn(&CarrierInfo) -> f32| {
-                entries.iter().map(f).sum::<f32>() / votes as f32
-            };
+            let avg =
+                |f: fn(&CarrierInfo) -> f32| entries.iter().map(f).sum::<f32>() / votes as f32;
             CarrierInfo {
-                freq:      entries[0].freq,
+                freq: entries[0].freq,
                 magnitude: avg(|e| e.magnitude),
-                phase:     avg(|e| e.phase),
+                phase: avg(|e| e.phase),
                 coherence: avg(|e| e.coherence),
-                score:     avg(|e| e.score),
+                score: avg(|e| e.score),
                 votes,
             }
         })
         .collect();
 
     result.sort_by(|a, b| {
-        b.votes.cmp(&a.votes)
-            .then(b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal))
+        b.votes.cmp(&a.votes).then(
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal),
+        )
     });
 
     if result.len() < 5 {
@@ -252,14 +309,17 @@ pub fn detect_carriers(
             "warn: only {} carriers detected; appending hard-coded fallbacks",
             result.len()
         );
-        let found: std::collections::HashSet<(i32, i32)> =
-            result.iter().map(|c| c.freq).collect();
+        let found: std::collections::HashSet<(i32, i32)> = result.iter().map(|c| c.freq).collect();
 
         for &freq in CARRIERS_DARK.iter().chain(CARRIERS_WHITE.iter()) {
             if !found.contains(&freq) {
                 result.push(CarrierInfo {
-                    freq, magnitude: 1000.0, phase: 0.0, coherence: 0.99,
-                    votes: 0, score: 50.0,
+                    freq,
+                    magnitude: 1000.0,
+                    phase: 0.0,
+                    coherence: 0.99,
+                    votes: 0,
+                    score: 50.0,
                 });
             }
         }
@@ -277,8 +337,12 @@ mod tests {
     #[test]
     fn all_carriers_is_union() {
         let all = all_carriers();
-        for &c in CARRIERS_DARK  { assert!(all.contains(&c)); }
-        for &c in CARRIERS_WHITE { assert!(all.contains(&c)); }
+        for &c in CARRIERS_DARK {
+            assert!(all.contains(&c));
+        }
+        for &c in CARRIERS_WHITE {
+            assert!(all.contains(&c));
+        }
         assert_eq!(all.len(), CARRIERS_DARK.len() + CARRIERS_WHITE.len());
     }
 
@@ -296,7 +360,11 @@ mod tests {
         let carriers = detect_carriers(&[], &[512], 100);
         let freqs: std::collections::HashSet<(i32, i32)> =
             carriers.iter().map(|c| c.freq).collect();
-        for &f in CARRIERS_DARK  { assert!(freqs.contains(&f), "{f:?} missing"); }
-        for &f in CARRIERS_WHITE { assert!(freqs.contains(&f), "{f:?} missing"); }
+        for &f in CARRIERS_DARK {
+            assert!(freqs.contains(&f), "{f:?} missing");
+        }
+        for &f in CARRIERS_WHITE {
+            assert!(freqs.contains(&f), "{f:?} missing");
+        }
     }
 }

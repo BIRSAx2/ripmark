@@ -68,10 +68,10 @@ impl Codebook {
 
         let views: Vec<ArrayView3<f32>> = resized.iter().map(|a| a.view()).collect();
 
-        let dark_phases  = reference_phases(&views, CARRIERS_DARK,  image_size);
-        let dark_coh     = phase_coherence_at(&views, CARRIERS_DARK,  image_size);
+        let dark_phases = reference_phases(&views, CARRIERS_DARK, image_size);
+        let dark_coh = phase_coherence_at(&views, CARRIERS_DARK, image_size);
         let white_phases = reference_phases(&views, CARRIERS_WHITE, image_size);
-        let white_coh    = phase_coherence_at(&views, CARRIERS_WHITE, image_size);
+        let white_coh = phase_coherence_at(&views, CARRIERS_WHITE, image_size);
 
         let mut noise_acc = Array3::<f64>::zeros((image_size, image_size, 3));
         for img in &resized {
@@ -79,10 +79,7 @@ impl Codebook {
                 noise_acc[[r, c, ch]] += *v as f64;
             }
         }
-        let reference_noise: Vec<f32> = noise_acc
-            .iter()
-            .map(|&v| (v / n as f64) as f32)
-            .collect();
+        let reference_noise: Vec<f32> = noise_acc.iter().map(|&v| (v / n as f64) as f32).collect();
 
         // Pairwise correlation on up to 50 images to calibrate the detector.
         let sample_size = n.min(50);
@@ -105,8 +102,14 @@ impl Codebook {
             source: source.into(),
             image_size,
             n_images: n,
-            dark:  CarrierProfile { ref_phases: dark_phases,  coherence: dark_coh },
-            white: CarrierProfile { ref_phases: white_phases, coherence: white_coh },
+            dark: CarrierProfile {
+                ref_phases: dark_phases,
+                coherence: dark_coh,
+            },
+            white: CarrierProfile {
+                ref_phases: white_phases,
+                coherence: white_coh,
+            },
             reference_noise,
             correlation_mean,
             correlation_std,
@@ -125,7 +128,8 @@ impl Codebook {
             .with_context(|| format!("cannot create {}", path.display()))?;
 
         file.write_all(MAGIC).context("write magic")?;
-        file.write_all(&(payload.len() as u64).to_le_bytes()).context("write length")?;
+        file.write_all(&(payload.len() as u64).to_le_bytes())
+            .context("write length")?;
         file.write_all(&payload).context("write payload")?;
 
         Ok(())
@@ -135,8 +139,8 @@ impl Codebook {
     pub fn load(path: &Path) -> Result<Self> {
         use std::io::Read;
 
-        let mut file = std::fs::File::open(path)
-            .with_context(|| format!("cannot open {}", path.display()))?;
+        let mut file =
+            std::fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
 
         let mut magic = [0u8; 8];
         file.read_exact(&mut magic).context("read magic")?;
@@ -175,17 +179,23 @@ fn pearson_correlation(a: &[f32], b: &[f32]) -> f32 {
     for (&ai, &bi) in a.iter().zip(b.iter()) {
         let da = ai - mean_a;
         let db = bi - mean_b;
-        num   += da * db;
+        num += da * db;
         den_a += da * da;
         den_b += db * db;
     }
 
     let denom = (den_a * den_b).sqrt();
-    if denom < 1e-10 { 0.0 } else { num / denom }
+    if denom < 1e-10 {
+        0.0
+    } else {
+        num / denom
+    }
 }
 
 fn mean_std(values: &[f32]) -> (f32, f32) {
-    if values.is_empty() { return (0.0, 0.0); }
+    if values.is_empty() {
+        return (0.0, 0.0);
+    }
     let n = values.len() as f32;
     let mean = values.iter().sum::<f32>() / n;
     let variance = values.iter().map(|&v| (v - mean) * (v - mean)).sum::<f32>() / n;
@@ -215,9 +225,9 @@ mod tests {
 
         assert_eq!(cb.image_size, 32);
         assert_eq!(cb.n_images, 4);
-        assert_eq!(cb.dark.ref_phases.len(),  CARRIERS_DARK.len());
+        assert_eq!(cb.dark.ref_phases.len(), CARRIERS_DARK.len());
         assert_eq!(cb.white.ref_phases.len(), CARRIERS_WHITE.len());
-        assert_eq!(cb.reference_noise.len(),  32 * 32 * 3);
+        assert_eq!(cb.reference_noise.len(), 32 * 32 * 3);
         assert!(cb.dark.coherence.iter().all(|v| v.is_finite()));
         assert!(cb.white.coherence.iter().all(|v| v.is_finite()));
     }
@@ -231,8 +241,8 @@ mod tests {
         cb.save(tmp.path()).expect("save failed");
         let loaded = Codebook::load(tmp.path()).expect("load failed");
 
-        assert_eq!(loaded.version,    cb.version);
-        assert_eq!(loaded.n_images,   cb.n_images);
+        assert_eq!(loaded.version, cb.version);
+        assert_eq!(loaded.n_images, cb.n_images);
         assert_eq!(loaded.image_size, cb.image_size);
 
         for (a, b) in cb.dark.ref_phases.iter().zip(loaded.dark.ref_phases.iter()) {

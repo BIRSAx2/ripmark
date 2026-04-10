@@ -12,8 +12,12 @@ pub struct Spectrum {
 }
 
 impl Spectrum {
-    pub fn height(&self) -> usize { self.data.nrows() }
-    pub fn width(&self)  -> usize { self.data.ncols() }
+    pub fn height(&self) -> usize {
+        self.data.nrows()
+    }
+    pub fn width(&self) -> usize {
+        self.data.ncols()
+    }
 
     /// Element-wise magnitude.
     pub fn magnitude(&self) -> Array2<f32> {
@@ -27,12 +31,16 @@ impl Spectrum {
 
     /// Shift zero-frequency to the centre (equivalent to numpy.fftshift).
     pub fn shifted(self) -> Self {
-        Self { data: fftshift(self.data) }
+        Self {
+            data: fftshift(self.data),
+        }
     }
 
     /// Undo a previous shift (equivalent to numpy.ifftshift).
     pub fn unshifted(self) -> Self {
-        Self { data: ifftshift(self.data) }
+        Self {
+            data: ifftshift(self.data),
+        }
     }
 
     /// Inverse FFT, returning the real part of the spatial output.
@@ -47,10 +55,7 @@ pub fn fft2(input: ArrayView2<f32>) -> Spectrum {
     let w = input.ncols();
     let mut planner = FftPlanner::<f32>::new();
 
-    let mut buf: Vec<Complex<f32>> = input
-        .iter()
-        .map(|&x| Complex::new(x, 0.0))
-        .collect();
+    let mut buf: Vec<Complex<f32>> = input.iter().map(|&x| Complex::new(x, 0.0)).collect();
 
     // Forward FFT along rows.
     let row_plan = planner.plan_fft_forward(w);
@@ -62,14 +67,17 @@ pub fn fft2(input: ArrayView2<f32>) -> Spectrum {
     let col_plan = planner.plan_fft_forward(h);
     let mut col = vec![Complex::new(0.0f32, 0.0); h];
     for c in 0..w {
-        for r in 0..h { col[r] = buf[r * w + c]; }
+        for r in 0..h {
+            col[r] = buf[r * w + c];
+        }
         col_plan.process(&mut col);
-        for r in 0..h { buf[r * w + c] = col[r]; }
+        for r in 0..h {
+            buf[r * w + c] = col[r];
+        }
     }
 
     Spectrum {
-        data: Array2::from_shape_vec((h, w), buf)
-            .expect("shape matches buffer length"),
+        data: Array2::from_shape_vec((h, w), buf).expect("shape matches buffer length"),
     }
 }
 
@@ -117,9 +125,7 @@ pub fn to_grayscale(image: ArrayView3<f32>) -> Array2<f32> {
     let h = image.shape()[0];
     let w = image.shape()[1];
     Array2::from_shape_fn((h, w), |(y, x)| {
-        0.299 * image[[y, x, 0]]
-            + 0.587 * image[[y, x, 1]]
-            + 0.114 * image[[y, x, 2]]
+        0.299 * image[[y, x, 0]] + 0.587 * image[[y, x, 1]] + 0.114 * image[[y, x, 2]]
     })
 }
 
@@ -188,9 +194,13 @@ fn ifft2(data: Array2<Complex<f32>>) -> Array2<f32> {
     let col_plan = planner.plan_fft_inverse(h);
     let mut col = vec![Complex::new(0.0f32, 0.0); h];
     for c in 0..w {
-        for r in 0..h { col[r] = buf[r * w + c]; }
+        for r in 0..h {
+            col[r] = buf[r * w + c];
+        }
         col_plan.process(&mut col);
-        for r in 0..h { buf[r * w + c] = col[r]; }
+        for r in 0..h {
+            buf[r * w + c] = col[r];
+        }
     }
 
     let norm = (h * w) as f32;
@@ -215,9 +225,7 @@ mod tests {
 
     #[test]
     fn fftshift_ifftshift_identity() {
-        let original = Array2::from_shape_fn((8, 8), |(r, c)| {
-            Complex::new(r as f32, c as f32)
-        });
+        let original = Array2::from_shape_fn((8, 8), |(r, c)| Complex::new(r as f32, c as f32));
         let result = ifftshift(fftshift(original.clone()));
         for (a, b) in original.iter().zip(result.iter()) {
             assert!((a.re - b.re).abs() < 1e-6);

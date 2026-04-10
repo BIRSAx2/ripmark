@@ -47,7 +47,11 @@ pub struct BypassResult {
 /// Remove the SynthID watermark from an image.
 ///
 /// `image` must be RGB, values in [0, 1], shape (H, W, 3).
-pub fn bypass(image: ArrayView3<f32>, codebook: &Codebook, mode: BypassMode) -> Result<BypassResult> {
+pub fn bypass(
+    image: ArrayView3<f32>,
+    codebook: &Codebook,
+    mode: BypassMode,
+) -> Result<BypassResult> {
     match mode {
         BypassMode::V1 => v1(image),
         BypassMode::V2 => v2(image),
@@ -71,7 +75,11 @@ fn v2(image: ArrayView3<f32>) -> Result<BypassResult> {
     let BypassResult { image: cycled, .. } = v1(smoothed.view())?;
     Ok(BypassResult {
         image: cycled,
-        stages: vec!["noise_injection".into(), "bilateral_smooth".into(), "jpeg_cycle_q50".into()],
+        stages: vec![
+            "noise_injection".into(),
+            "bilateral_smooth".into(),
+            "jpeg_cycle_q50".into(),
+        ],
     })
 }
 
@@ -79,16 +87,17 @@ fn v2(image: ArrayView3<f32>) -> Result<BypassResult> {
 fn v3(image: ArrayView3<f32>, codebook: &Codebook) -> Result<BypassResult> {
     // Three passes with decreasing aggressiveness.
     // (removal_fraction, consistency_floor)
-    let passes: &[(f32, f32)] = &[
-        (0.95, 0.30),
-        (0.80, 0.50),
-        (0.60, 0.70),
-    ];
+    let passes: &[(f32, f32)] = &[(0.95, 0.30), (0.80, 0.50), (0.60, 0.70)];
 
     let mut current = image.to_owned();
 
     for &(removal_fraction, consistency_floor) in passes {
-        current = spectral_pass(current.view(), codebook, removal_fraction, consistency_floor);
+        current = spectral_pass(
+            current.view(),
+            codebook,
+            removal_fraction,
+            consistency_floor,
+        );
     }
 
     // Light Gaussian blur to smooth any spectral artefacts.
@@ -149,18 +158,24 @@ fn spectral_pass(
 
         for carriers in [dark_carriers.as_slice(), white_carriers.as_slice()] {
             for &(fy, fx, coherence, ref_phase) in carriers {
-                if coherence < consistency_floor { continue; }
+                if coherence < consistency_floor {
+                    continue;
+                }
 
                 // Map shifted carrier (fy, fx) back to unshifted FFT index.
                 let (uy, ux) = shifted_to_unshifted(fy, fx, size);
-                if uy >= size || ux >= size { continue; }
+                if uy >= size || ux >= size {
+                    continue;
+                }
 
                 let bin = fft_data[[uy, ux]];
                 let img_mag = bin.norm();
-                if img_mag < 1e-10 { continue; }
+                if img_mag < 1e-10 {
+                    continue;
+                }
 
-                let subtract_mag = (img_mag * coherence * removal_fraction * weight)
-                    .min(SAFETY_CAP * img_mag);
+                let subtract_mag =
+                    (img_mag * coherence * removal_fraction * weight).min(SAFETY_CAP * img_mag);
 
                 let subtract = Complex::new(
                     subtract_mag * ref_phase.cos(),
@@ -175,7 +190,9 @@ fn spectral_pass(
         let cleaned_resized = Spectrum { data: fft_data }.to_spatial();
         let cleaned = crate::fft::resize_gray(&cleaned_resized, h, w);
 
-        result.slice_mut(s![.., .., ch]).assign(&cleaned.mapv(|v| v.clamp(0.0, 1.0)));
+        result
+            .slice_mut(s![.., .., ch])
+            .assign(&cleaned.mapv(|v| v.clamp(0.0, 1.0)));
     }
 
     result
@@ -206,12 +223,10 @@ fn jpeg_cycle(image: ArrayView3<f32>, _quality: u8) -> Result<Array3<f32>> {
 
     // Encode to JPEG.
     let mut buf = Vec::new();
-    DynamicImage::ImageRgb8(rgb)
-        .write_to(&mut Cursor::new(&mut buf), ImageFormat::Jpeg)?;
+    DynamicImage::ImageRgb8(rgb).write_to(&mut Cursor::new(&mut buf), ImageFormat::Jpeg)?;
 
     // Decode back.
-    let decoded = image::load_from_memory_with_format(&buf, ImageFormat::Jpeg)?
-        .into_rgb8();
+    let decoded = image::load_from_memory_with_format(&buf, ImageFormat::Jpeg)?.into_rgb8();
 
     let out = Array3::from_shape_fn((h as usize, w as usize, 3), |(y, x, c)| {
         decoded.get_pixel(x as u32, y as u32)[c] as f32 / 255.0
@@ -226,10 +241,14 @@ fn add_gaussian_noise(image: ArrayView3<f32>, sigma: f32) -> Array3<f32> {
     let scale = sigma / 255.0;
     let mut state: u64 = 0x123456789abcdef0;
     Array3::from_shape_fn(image.dim(), |(r, c, ch)| {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         // Box-Muller via two uniform samples.
         let u1 = (state >> 33) as f32 / (u32::MAX as f32);
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let u2 = (state >> 33) as f32 / (u32::MAX as f32);
         let gauss = (-2.0 * (u1 + 1e-10).ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos();
         (image[[r, c, ch]] + gauss * scale).clamp(0.0, 1.0)
@@ -238,7 +257,12 @@ fn add_gaussian_noise(image: ArrayView3<f32>, sigma: f32) -> Array3<f32> {
 
 // Simplified bilateral filter: edge-preserving spatial smoothing.
 // Uses a small spatial kernel with range weighting based on intensity difference.
-fn bilateral_smooth(image: ArrayView3<f32>, radius: i32, sigma_space: f32, sigma_range: f32) -> Array3<f32> {
+fn bilateral_smooth(
+    image: ArrayView3<f32>,
+    radius: i32,
+    sigma_space: f32,
+    sigma_range: f32,
+) -> Array3<f32> {
     let h = image.shape()[0] as i32;
     let w = image.shape()[1] as i32;
     let ss2 = 2.0 * sigma_space * sigma_space;
@@ -255,21 +279,27 @@ fn bilateral_smooth(image: ArrayView3<f32>, radius: i32, sigma_space: f32, sigma
                 let nx = (x as i32 + dx).clamp(0, w - 1) as usize;
                 let val = image[[ny, nx, c]];
                 let spatial_w = (-(dy * dy + dx * dx) as f32 / ss2).exp();
-                let range_w   = (-(val - center_val).powi(2) / sr2).exp();
+                let range_w = (-(val - center_val).powi(2) / sr2).exp();
                 let w = spatial_w * range_w;
                 sum += val * w;
                 weight_sum += w;
             }
         }
 
-        if weight_sum < 1e-10 { center_val } else { (sum / weight_sum).clamp(0.0, 1.0) }
+        if weight_sum < 1e-10 {
+            center_val
+        } else {
+            (sum / weight_sum).clamp(0.0, 1.0)
+        }
     })
 }
 
 // Separable Gaussian blur with the given sigma.
 // Uses a 1-D kernel of radius ceil(3*sigma).
 fn gaussian_blur(image: ArrayView3<f32>, sigma: f32) -> Array3<f32> {
-    if sigma < 1e-6 { return image.to_owned(); }
+    if sigma < 1e-6 {
+        return image.to_owned();
+    }
 
     let radius = (3.0 * sigma).ceil() as i32;
     let kernel: Vec<f32> = (-radius..=radius)
@@ -317,14 +347,16 @@ fn gaussian_blur(image: ArrayView3<f32>, sigma: f32) -> Array3<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::Array3;
     use crate::codebook::Codebook;
+    use ndarray::Array3;
 
     fn dummy_codebook() -> Codebook {
         let images: Vec<Array3<f32>> = (0..4)
-            .map(|i| Array3::from_shape_fn((64, 64, 3), |(r, c, ch)| {
-                ((r + c + ch + i * 11) as f32 / 192.0).min(1.0)
-            }))
+            .map(|i| {
+                Array3::from_shape_fn((64, 64, 3), |(r, c, ch)| {
+                    ((r + c + ch + i * 11) as f32 / 192.0).min(1.0)
+                })
+            })
             .collect();
         Codebook::build(&images, 64, "test")
     }
@@ -357,12 +389,16 @@ mod tests {
         let img = test_image();
         let cb = dummy_codebook();
         let result = bypass(img.view(), &cb, BypassMode::V3).unwrap();
-        let max_diff = img.iter()
+        let max_diff = img
+            .iter()
             .zip(result.image.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f32, f32::max);
         // Spectral subtraction on a non-watermarked image should change it minimally.
-        assert!(max_diff < 0.5, "V3 changed image too much: max_diff={max_diff}");
+        assert!(
+            max_diff < 0.5,
+            "V3 changed image too much: max_diff={max_diff}"
+        );
     }
 
     #[test]

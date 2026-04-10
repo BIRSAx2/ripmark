@@ -5,11 +5,11 @@
 //! phase-coherence map across the spectrum and a ranked list of candidate
 //! carrier frequencies.
 
-use ndarray::{Array1, Array2, Array3, ArrayView3};
+use ndarray::{Array2, Array3, ArrayView3};
 
 use crate::carriers::{detect_carriers, CarrierInfo};
 use crate::denoise::extract_noise_fused;
-use crate::fft::{fft2, fftshift, fftshift_real, resize_rgb, to_grayscale};
+use crate::fft::{fft2, fftshift, resize_rgb, to_grayscale};
 
 /// Output of a full-spectrum analysis run.
 #[derive(Debug, Clone)]
@@ -51,8 +51,7 @@ pub fn analyze_image_set(
         .map(|img| resize_rgb(img, image_size, image_size))
         .collect();
 
-    let (magnitude_spectrum, phase_coherence_map) =
-        full_spectrum_stats(&resized, image_size);
+    let (magnitude_spectrum, phase_coherence_map) = full_spectrum_stats(&resized, image_size);
 
     let views: Vec<ArrayView3<f32>> = resized.iter().map(|a| a.view()).collect();
     let top_carriers = detect_carriers(&views, scales, 100);
@@ -70,14 +69,11 @@ pub fn analyze_image_set(
 
 // Compute per-bin average magnitude and phase coherence across all images.
 // Both returned arrays are in fftshift layout (zero-frequency at centre).
-fn full_spectrum_stats(
-    images: &[Array3<f32>],
-    size: usize,
-) -> (Array2<f32>, Array2<f32>) {
+fn full_spectrum_stats(images: &[Array3<f32>], size: usize) -> (Array2<f32>, Array2<f32>) {
     use rustfft::num_complex::Complex;
 
     let n = images.len() as f32;
-    let mut mag_sum   = Array2::<f32>::zeros((size, size));
+    let mut mag_sum = Array2::<f32>::zeros((size, size));
     let mut phase_vec = Array2::<Complex<f32>>::zeros((size, size));
 
     for img in images {
@@ -91,7 +87,7 @@ fn full_spectrum_stats(
         }
     }
 
-    let avg_magnitude  = mag_sum.mapv(|v| v / n);
+    let avg_magnitude = mag_sum.mapv(|v| v / n);
     let phase_coherence = phase_vec.mapv(|v| v.norm() / n);
 
     (avg_magnitude, phase_coherence)
@@ -138,11 +134,15 @@ fn pca_noise_component(images: &[Array3<f32>], size: usize) -> Array2<f32> {
     }
 
     // Normalise.
-    let norm = component.iter().map(|&v| v * v).sum::<f32>().sqrt().max(1e-10);
+    let norm = component
+        .iter()
+        .map(|&v| v * v)
+        .sum::<f32>()
+        .sqrt()
+        .max(1e-10);
     let component: Vec<f32> = component.iter().map(|&v| v / norm).collect();
 
-    Array2::from_shape_vec((size, size), component)
-        .expect("shape matches size*size")
+    Array2::from_shape_vec((size, size), component).expect("shape matches size*size")
 }
 
 // Power iteration to find the leading eigenvector of a symmetric n x n matrix.
@@ -160,7 +160,9 @@ fn power_iteration(matrix: &[f32], n: usize, iters: usize) -> Vec<f32> {
         }
         // Normalise.
         let norm = w.iter().map(|&x| x * x).sum::<f32>().sqrt().max(1e-10);
-        for i in 0..n { v[i] = w[i] / norm; }
+        for i in 0..n {
+            v[i] = w[i] / norm;
+        }
     }
 
     v
@@ -234,20 +236,24 @@ mod tests {
     #[test]
     fn power_iteration_finds_dominant_direction() {
         // Matrix with clear leading eigenvector along [1, 0, 0].
-        let matrix = vec![
-            9.0_f32, 0.0, 0.0,
-            0.0,     4.0, 0.0,
-            0.0,     0.0, 1.0,
-        ];
+        let matrix = vec![9.0_f32, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 1.0];
         let v = power_iteration(&matrix, 3, 50);
-        assert!(v[0].abs() > 0.99, "expected leading direction [1,0,0], got {v:?}");
+        assert!(
+            v[0].abs() > 0.99,
+            "expected leading direction [1,0,0], got {v:?}"
+        );
     }
 
     #[test]
     fn top_coherent_bins_returns_n_results() {
         let images = dummy_images(4, 32);
         let report = analyze_image_set(&images, 32, &[32]);
-        let bins = top_coherent_bins(&report.phase_coherence_map, &report.magnitude_spectrum, 10, 2);
+        let bins = top_coherent_bins(
+            &report.phase_coherence_map,
+            &report.magnitude_spectrum,
+            10,
+            2,
+        );
         assert_eq!(bins.len(), 10);
     }
 }
