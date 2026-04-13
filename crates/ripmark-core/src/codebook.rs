@@ -1,10 +1,9 @@
-//! Codebook: extracted SynthID watermark profile used for detection and bypass.
+//! Codebook: extracted SynthID watermark profiles used for detection and bypass.
 //!
-//! Built from a set of Gemini-generated images. Stores reference phases at known
-//! carrier frequencies, phase coherence scores, an average noise residual, and
-//! detection calibration statistics.
-//!
-//! Saved to `.ripbook` files (bincode, length-prefixed with magic header).
+//! A single `.ripbook` can store multiple profiles keyed by target image
+//! resolution. Each profile contains the carrier reference phases, coherence
+//! scores, a reference noise residual, and calibration statistics for one
+//! resolution bucket.
 
 use std::path::Path;
 
@@ -31,12 +30,14 @@ pub struct CarrierProfile {
     pub coherence: Vec<f32>,
 }
 
-/// The complete watermark profile extracted from a set of Gemini images.
+/// Watermark profile for one target resolution bucket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Codebook {
-    pub version: u32,
-    pub source: String,
-    /// Square size in pixels at which all processing is done (typically 512).
+pub struct ResolutionProfile {
+    /// Target image height for this profile.
+    pub height: usize,
+    /// Target image width for this profile.
+    pub width: usize,
+    /// Square processing size used internally by the current Rust pipeline.
     pub image_size: usize,
     pub n_images: usize,
     /// Profile for the dark-image carrier set (diagonal grid).
@@ -54,12 +55,51 @@ pub struct Codebook {
     pub detection_threshold: f32,
 }
 
+impl ResolutionProfile {
+    /// Return the reference noise as an (image_size, image_size, 3) array.
+    pub fn reference_noise_array(&self) -> Array3<f32> {
+        let s = self.image_size;
+        Array3::from_shape_vec((s, s, 3), self.reference_noise.clone())
+            .expect("reference_noise length matches image_size")
+    }
+}
+
+/// Multi-resolution codebook for detection and bypass.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Codebook {
+    pub version: u32,
+    pub source: String,
+    pub profiles: Vec<ResolutionProfile>,
+}
+
 impl Codebook {
-    /// Build a codebook from a set of watermarked images (RGB, values in [0, 1]).
-    /// All images are internally resized to image_size x image_size.
+    /// Build a single-profile codebook from a set of watermarked images.
+    ///
+    /// The created profile is keyed to `(image_size, image_size)` for backwards
+    /// compatibility with the original single-resolution implementation.
     pub fn build(images: &[Array3<f32>], image_size: usize, source: impl Into<String>) -> Self {
+        let source = source.into();
+        let profile = Self::build_profile(images, image_size, image_size, image_size);
+        Self {
+            version: 2,
+            source,
+            profiles: vec![profile],
+        }
+    }
+
+    /// Build one resolution profile from a set of watermarked images.
+    ///
+    /// `height` and `width` describe the target image resolution this profile
+    /// should be selected for. `image_size` is the square internal processing
+    /// size used by the current Rust implementation.
+    pub fn build_profile(
+        images: &[Array3<f32>],
+        height: usize,
+        width: usize,
+        image_size: usize,
+    ) -> ResolutionProfile {
         let n = images.len();
-        assert!(n > 0, "need at least one image to build a codebook");
+        assert!(n > 0, "need at least one image to build a codebook profile");
 
         let resized: Vec<Array3<f32>> = images
             .iter()
@@ -81,7 +121,6 @@ impl Codebook {
         }
         let reference_noise: Vec<f32> = noise_acc.iter().map(|&v| (v / n as f64) as f32).collect();
 
-        // Pairwise correlation on up to 50 images to calibrate the detector.
         let sample_size = n.min(50);
         let noises: Vec<Vec<f32>> = resized[..sample_size]
             .iter()
@@ -97,9 +136,9 @@ impl Codebook {
 
         let (correlation_mean, correlation_std) = mean_std(&correlations);
 
-        Codebook {
-            version: 1,
-            source: source.into(),
+        ResolutionProfile {
+            height,
+            width,
             image_size,
             n_images: n,
             dark: CarrierProfile {
@@ -115,6 +154,63 @@ impl Codebook {
             correlation_std,
             detection_threshold: correlation_mean - 2.5 * correlation_std,
         }
+    }
+
+    /// Add a profile to the codebook, replacing any existing entry for the same
+    /// `(height, width)` bucket.
+    pub fn add_profile(&mut self, profile: ResolutionProfile) {
+        if let Some(existing) = self
+            .profiles
+            .iter_mut()
+            .find(|p| p.height == profile.height && p.width == profile.width)
+        {
+            *existing = profile;
+        } else {
+            self.profiles.push(profile);
+        }
+    }
+
+    pub fn resolutions(&self) -> Vec<(usize, usize)> {
+        self.profiles.iter().map(|p| (p.height, p.width)).collect()
+    }
+
+    pub fn primary_profile(&self) -> Option<&ResolutionProfile> {
+        self.profiles.first()
+    }
+
+    /// Best-matching profile for target `(height, width)`.
+    ///
+    /// Prefers exact resolution matches, else chooses the closest aspect ratio
+    /// and pixel count, following the Python `SpectralCodebook` heuristic.
+    pub fn best_profile(&self, height: usize, width: usize) -> Result<(&ResolutionProfile, bool)> {
+        if let Some(exact) = self
+            .profiles
+            .iter()
+            .find(|profile| profile.height == height && profile.width == width)
+        {
+            return Ok((exact, true));
+        }
+
+        if self.profiles.is_empty() {
+            anyhow::bail!("codebook has no profiles");
+        }
+
+        let target_ar = height as f64 / (width.max(1) as f64);
+        let target_px = (height * width).max(1) as f64;
+
+        let best = self
+            .profiles
+            .iter()
+            .min_by(|a, b| {
+                let score_a = profile_match_score(a, target_ar, target_px);
+                let score_b = profile_match_score(b, target_ar, target_px);
+                score_a
+                    .partial_cmp(&score_b)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .expect("non-empty profiles");
+
+        Ok((best, false))
     }
 
     /// Save codebook to a `.ripbook` file.
@@ -136,6 +232,9 @@ impl Codebook {
     }
 
     /// Load codebook from a `.ripbook` file.
+    ///
+    /// Supports both the current multi-profile format and the original
+    /// single-profile format used earlier in this Rust port.
     pub fn load(path: &Path) -> Result<Self> {
         use std::io::Read;
 
@@ -155,19 +254,63 @@ impl Codebook {
         let mut payload = vec![0u8; payload_len];
         file.read_exact(&mut payload).context("read payload")?;
 
-        let (codebook, _): (Codebook, _) =
+        if let Ok((codebook, _)) =
+            bincode::serde::decode_from_slice::<Codebook, _>(&payload, bincode::config::standard())
+        {
+            if codebook.version >= 2 && !codebook.profiles.is_empty() {
+                return Ok(codebook);
+            }
+        }
+
+        let (legacy, _): (LegacyCodebook, _) =
             bincode::serde::decode_from_slice(&payload, bincode::config::standard())
                 .context("failed to decode codebook")?;
 
-        Ok(codebook)
+        Ok(legacy.into())
     }
+}
 
-    /// Return the reference noise as an (image_size, image_size, 3) array.
-    pub fn reference_noise_array(&self) -> Array3<f32> {
-        let s = self.image_size;
-        Array3::from_shape_vec((s, s, 3), self.reference_noise.clone())
-            .expect("reference_noise length matches image_size")
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyCodebook {
+    version: u32,
+    source: String,
+    image_size: usize,
+    n_images: usize,
+    dark: CarrierProfile,
+    white: CarrierProfile,
+    reference_noise: Vec<f32>,
+    correlation_mean: f32,
+    correlation_std: f32,
+    detection_threshold: f32,
+}
+
+impl From<LegacyCodebook> for Codebook {
+    fn from(value: LegacyCodebook) -> Self {
+        Self {
+            version: value.version.max(2),
+            source: value.source,
+            profiles: vec![ResolutionProfile {
+                height: value.image_size,
+                width: value.image_size,
+                image_size: value.image_size,
+                n_images: value.n_images,
+                dark: value.dark,
+                white: value.white,
+                reference_noise: value.reference_noise,
+                correlation_mean: value.correlation_mean,
+                correlation_std: value.correlation_std,
+                detection_threshold: value.detection_threshold,
+            }],
+        }
     }
+}
+
+fn profile_match_score(profile: &ResolutionProfile, target_ar: f64, target_px: f64) -> f64 {
+    let profile_ar = profile.height as f64 / (profile.width.max(1) as f64);
+    let profile_px = (profile.height * profile.width).max(1) as f64;
+    let ar_diff = (profile_ar - target_ar).abs() / target_ar.max(1e-9);
+    let px_diff = (profile_px - target_px).abs() / target_px.max(1e-9);
+    ar_diff * 2.0 + px_diff
 }
 
 fn pearson_correlation(a: &[f32], b: &[f32]) -> f32 {
@@ -208,11 +351,11 @@ mod tests {
     use ndarray::Array3;
     use tempfile::NamedTempFile;
 
-    fn dummy_images(n: usize, size: usize) -> Vec<Array3<f32>> {
+    fn dummy_images(n: usize, h: usize, w: usize) -> Vec<Array3<f32>> {
         (0..n)
             .map(|i| {
-                Array3::from_shape_fn((size, size, 3), |(r, c, ch)| {
-                    ((r + c + ch + i * 7) as f32 / (size * 3) as f32).min(1.0)
+                Array3::from_shape_fn((h, w, 3), |(r, c, ch)| {
+                    ((r + c + ch + i * 7) as f32 / ((h + w + 3) as f32)).min(1.0)
                 })
             })
             .collect()
@@ -220,34 +363,108 @@ mod tests {
 
     #[test]
     fn build_codebook_basic() {
-        let images = dummy_images(4, 32);
-        let cb = Codebook::build(&images, 32, "test");
+        let images = dummy_images(4, 32, 48);
+        let profile = Codebook::build_profile(&images, 32, 48, 32);
 
-        assert_eq!(cb.image_size, 32);
-        assert_eq!(cb.n_images, 4);
-        assert_eq!(cb.dark.ref_phases.len(), CARRIERS_DARK.len());
-        assert_eq!(cb.white.ref_phases.len(), CARRIERS_WHITE.len());
-        assert_eq!(cb.reference_noise.len(), 32 * 32 * 3);
-        assert!(cb.dark.coherence.iter().all(|v| v.is_finite()));
-        assert!(cb.white.coherence.iter().all(|v| v.is_finite()));
+        assert_eq!(profile.height, 32);
+        assert_eq!(profile.width, 48);
+        assert_eq!(profile.image_size, 32);
+        assert_eq!(profile.n_images, 4);
+        assert_eq!(profile.dark.ref_phases.len(), CARRIERS_DARK.len());
+        assert_eq!(profile.white.ref_phases.len(), CARRIERS_WHITE.len());
+        assert_eq!(profile.reference_noise.len(), 32 * 32 * 3);
+        assert!(profile.dark.coherence.iter().all(|v| v.is_finite()));
+        assert!(profile.white.coherence.iter().all(|v| v.is_finite()));
     }
 
     #[test]
     fn codebook_save_load_roundtrip() {
-        let images = dummy_images(3, 32);
-        let cb = Codebook::build(&images, 32, "roundtrip-test");
+        let images_a = dummy_images(3, 32, 32);
+        let images_b = dummy_images(3, 48, 64);
+
+        let mut cb = Codebook {
+            version: 2,
+            source: "roundtrip-test".into(),
+            profiles: vec![Codebook::build_profile(&images_a, 32, 32, 32)],
+        };
+        cb.add_profile(Codebook::build_profile(&images_b, 48, 64, 64));
 
         let tmp = NamedTempFile::new().unwrap();
         cb.save(tmp.path()).expect("save failed");
         let loaded = Codebook::load(tmp.path()).expect("load failed");
 
         assert_eq!(loaded.version, cb.version);
-        assert_eq!(loaded.n_images, cb.n_images);
-        assert_eq!(loaded.image_size, cb.image_size);
+        assert_eq!(loaded.profiles.len(), 2);
+        assert!(loaded.resolutions().contains(&(32, 32)));
+        assert!(loaded.resolutions().contains(&(48, 64)));
+    }
 
-        for (a, b) in cb.dark.ref_phases.iter().zip(loaded.dark.ref_phases.iter()) {
-            assert!((a - b).abs() < 1e-5, "phase mismatch: {a} vs {b}");
-        }
+    #[test]
+    fn best_profile_prefers_exact_resolution() {
+        let images = dummy_images(3, 32, 32);
+        let mut cb = Codebook {
+            version: 2,
+            source: "exact-match".into(),
+            profiles: vec![Codebook::build_profile(&images, 512, 512, 32)],
+        };
+        cb.add_profile(Codebook::build_profile(&images, 768, 1024, 32));
+
+        let (profile, exact) = cb.best_profile(768, 1024).unwrap();
+        assert!(exact);
+        assert_eq!((profile.height, profile.width), (768, 1024));
+    }
+
+    #[test]
+    fn best_profile_falls_back_to_closest_aspect_ratio() {
+        let images = dummy_images(3, 32, 32);
+        let mut cb = Codebook {
+            version: 2,
+            source: "fallback-match".into(),
+            profiles: vec![Codebook::build_profile(&images, 512, 512, 32)],
+        };
+        cb.add_profile(Codebook::build_profile(&images, 768, 1024, 32));
+
+        let (profile, exact) = cb.best_profile(720, 960).unwrap();
+        assert!(!exact);
+        assert_eq!((profile.height, profile.width), (768, 1024));
+    }
+
+    #[test]
+    fn legacy_codebook_loads_as_single_profile() {
+        let legacy = LegacyCodebook {
+            version: 1,
+            source: "legacy".into(),
+            image_size: 32,
+            n_images: 4,
+            dark: CarrierProfile {
+                ref_phases: vec![0.0; CARRIERS_DARK.len()],
+                coherence: vec![1.0; CARRIERS_DARK.len()],
+            },
+            white: CarrierProfile {
+                ref_phases: vec![0.0; CARRIERS_WHITE.len()],
+                coherence: vec![1.0; CARRIERS_WHITE.len()],
+            },
+            reference_noise: vec![0.0; 32 * 32 * 3],
+            correlation_mean: 0.1,
+            correlation_std: 0.01,
+            detection_threshold: 0.075,
+        };
+
+        let payload = bincode::serde::encode_to_vec(&legacy, bincode::config::standard()).unwrap();
+
+        let tmp = NamedTempFile::new().unwrap();
+        use std::io::Write;
+        let mut file = std::fs::File::create(tmp.path()).unwrap();
+        file.write_all(MAGIC).unwrap();
+        file.write_all(&(payload.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(&payload).unwrap();
+
+        let loaded = Codebook::load(tmp.path()).unwrap();
+        assert_eq!(loaded.profiles.len(), 1);
+        let profile = loaded.primary_profile().unwrap();
+        assert_eq!((profile.height, profile.width), (32, 32));
+        assert_eq!(profile.image_size, 32);
     }
 
     #[test]

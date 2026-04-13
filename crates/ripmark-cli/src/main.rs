@@ -75,6 +75,8 @@ enum Command {
 struct DetectOutput {
     image: String,
     codebook: String,
+    selected_profile: String,
+    exact_profile_match: bool,
     watermarked: bool,
     confidence: f32,
     threshold: f32,
@@ -91,10 +93,12 @@ struct DetectOutput {
 struct ExtractOutput {
     image_dir: String,
     output: String,
+    profile_resolution: String,
     n_images: usize,
     image_size: usize,
     requested_scales: Vec<u32>,
     codebook_version: u32,
+    resolutions: Vec<String>,
     detection_threshold: f32,
     correlation_mean: f32,
     correlation_std: f32,
@@ -175,11 +179,14 @@ fn run_detect(
 ) -> Result<()> {
     let image = load_rgb_image(image_path)?;
     let codebook = Codebook::load(codebook_path)?;
+    let (profile, exact_match) = codebook.best_profile(image.dim().0, image.dim().1)?;
     let result = detect(image.view(), &codebook);
 
     let output = DetectOutput {
         image: image_path.display().to_string(),
         codebook: codebook_path.display().to_string(),
+        selected_profile: format!("{}x{}", profile.height, profile.width),
+        exact_profile_match: exact_match,
         watermarked: result.confidence > threshold,
         confidence: result.confidence,
         threshold,
@@ -198,6 +205,15 @@ fn run_detect(
         println!("watermarked: {}", output.watermarked);
         println!("confidence: {:.3}", output.confidence);
         println!("threshold:  {:.3}", output.threshold);
+        println!(
+            "profile:    {}{}",
+            output.selected_profile,
+            if output.exact_profile_match {
+                ""
+            } else {
+                " (fallback)"
+            }
+        );
         println!(
             "phase_match: {:.3} (best carrier set: {})",
             output.phase_match, output.best_set
@@ -222,8 +238,27 @@ fn run_extract(
     max_images: usize,
     scales: &[u32],
 ) -> Result<()> {
-    let image_paths = collect_image_paths(image_dir, max_images)?;
-    let images = load_images(&image_paths)?;
+    let image_paths = collect_image_paths(image_dir, usize::MAX)?;
+    let (profile_height, profile_width) = image_dimensions(&image_paths[0])?;
+    let filtered_paths: Vec<PathBuf> = image_paths
+        .into_iter()
+        .filter(|path| {
+            image_dimensions(path)
+                .map(|dims| dims == (profile_height, profile_width))
+                .unwrap_or(false)
+        })
+        .take(max_images)
+        .collect();
+    if filtered_paths.is_empty() {
+        bail!(
+            "no images matching resolution {}x{} found in {}",
+            profile_height,
+            profile_width,
+            image_dir.display()
+        );
+    }
+
+    let images = load_images(&filtered_paths)?;
     let image_size = choose_extract_size(scales);
 
     if let Some(parent) = output_path.parent() {
@@ -233,30 +268,48 @@ fn run_extract(
         }
     }
 
-    let codebook = Codebook::build(&images, image_size, image_dir.display().to_string());
+    let profile = Codebook::build_profile(&images, profile_height, profile_width, image_size);
+    let mut codebook = if output_path.exists() {
+        Codebook::load(output_path)?
+    } else {
+        Codebook {
+            version: 2,
+            source: image_dir.display().to_string(),
+            profiles: Vec::new(),
+        }
+    };
+    codebook.add_profile(profile.clone());
     codebook.save(output_path)?;
 
     let output = ExtractOutput {
         image_dir: image_dir.display().to_string(),
         output: output_path.display().to_string(),
+        profile_resolution: format!("{}x{}", profile.height, profile.width),
         n_images: images.len(),
         image_size,
         requested_scales: scales.to_vec(),
         codebook_version: codebook.version,
-        detection_threshold: codebook.detection_threshold,
-        correlation_mean: codebook.correlation_mean,
-        correlation_std: codebook.correlation_std,
+        resolutions: codebook
+            .resolutions()
+            .into_iter()
+            .map(|(h, w)| format!("{h}x{w}"))
+            .collect(),
+        detection_threshold: profile.detection_threshold,
+        correlation_mean: profile.correlation_mean,
+        correlation_std: profile.correlation_std,
     };
 
     if json {
         print_json(&output)?;
     } else {
         println!("extracted codebook: {}", output.output);
+        println!("profile_resolution: {}", output.profile_resolution);
         println!("images:             {}", output.n_images);
         println!("image_size:         {}", output.image_size);
         println!("requested_scales:   {:?}", output.requested_scales);
         if verbose {
             println!("version:            {}", output.codebook_version);
+            println!("resolutions:        {}", output.resolutions.join(", "));
             println!("detection_threshold:{:.4}", output.detection_threshold);
             println!("correlation_mean:   {:.4}", output.correlation_mean);
             println!("correlation_std:    {:.4}", output.correlation_std);
@@ -413,6 +466,12 @@ fn collect_image_paths(dir: &Path, max_images: usize) -> Result<Vec<PathBuf>> {
 
 fn load_images(paths: &[PathBuf]) -> Result<Vec<Array3<f32>>> {
     paths.iter().map(|path| load_rgb_image(path)).collect()
+}
+
+fn image_dimensions(path: &Path) -> Result<(usize, usize)> {
+    let (width, height) = image::image_dimensions(path)
+        .with_context(|| format!("failed to read image dimensions for {}", path.display()))?;
+    Ok((height as usize, width as usize))
 }
 
 fn load_rgb_image(path: &Path) -> Result<Array3<f32>> {

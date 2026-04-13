@@ -15,7 +15,7 @@
 use ndarray::ArrayView3;
 
 use crate::carriers::{all_carriers, CARRIERS_DARK, CARRIERS_WHITE};
-use crate::codebook::Codebook;
+use crate::codebook::{Codebook, ResolutionProfile};
 use crate::denoise::extract_noise_fused;
 use crate::fft::{fft2, fftshift, resize_rgb, to_grayscale};
 
@@ -52,7 +52,14 @@ pub struct DetectionResult {
 ///
 /// `image` must be RGB, values in [0, 1], shape (H, W, 3).
 pub fn detect(image: ArrayView3<f32>, codebook: &Codebook) -> DetectionResult {
-    let size = codebook.image_size;
+    let (profile, _) = codebook
+        .best_profile(image.shape()[0], image.shape()[1])
+        .expect("codebook has at least one profile");
+    detect_with_profile(image, profile)
+}
+
+fn detect_with_profile(image: ArrayView3<f32>, profile: &ResolutionProfile) -> DetectionResult {
+    let size = profile.image_size;
     let center = size as i32 / 2;
 
     let resized = resize_rgb(&image.to_owned(), size, size);
@@ -66,14 +73,14 @@ pub fn detect(image: ArrayView3<f32>, codebook: &Codebook) -> DetectionResult {
     let dark_phase_match = phase_match(
         &img_phase,
         CARRIERS_DARK,
-        &codebook.dark.ref_phases,
+        &profile.dark.ref_phases,
         center,
         size,
     );
     let white_phase_match = phase_match(
         &img_phase,
         CARRIERS_WHITE,
-        &codebook.white.ref_phases,
+        &profile.white.ref_phases,
         center,
         size,
     );

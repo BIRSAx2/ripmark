@@ -21,7 +21,7 @@ use ndarray::{s, Array3, ArrayView3};
 use rustfft::num_complex::Complex;
 
 use crate::carriers::{CARRIERS_DARK, CARRIERS_WHITE};
-use crate::codebook::Codebook;
+use crate::codebook::{Codebook, ResolutionProfile};
 use crate::fft::{fft2, Spectrum};
 
 /// Which removal strategy to use.
@@ -85,6 +85,8 @@ fn v2(image: ArrayView3<f32>) -> Result<BypassResult> {
 
 // V3: multi-pass spectral subtraction.
 fn v3(image: ArrayView3<f32>, codebook: &Codebook) -> Result<BypassResult> {
+    let (profile, _) = codebook.best_profile(image.shape()[0], image.shape()[1])?;
+
     // Three passes with decreasing aggressiveness.
     // (removal_fraction, consistency_floor)
     let passes: &[(f32, f32)] = &[(0.95, 0.30), (0.80, 0.50), (0.60, 0.70)];
@@ -92,12 +94,7 @@ fn v3(image: ArrayView3<f32>, codebook: &Codebook) -> Result<BypassResult> {
     let mut current = image.to_owned();
 
     for &(removal_fraction, consistency_floor) in passes {
-        current = spectral_pass(
-            current.view(),
-            codebook,
-            removal_fraction,
-            consistency_floor,
-        );
+        current = spectral_pass(current.view(), profile, removal_fraction, consistency_floor);
     }
 
     // Light Gaussian blur to smooth any spectral artefacts.
@@ -117,7 +114,7 @@ fn v3(image: ArrayView3<f32>, codebook: &Codebook) -> Result<BypassResult> {
 // Single spectral subtraction pass over all channels and carrier sets.
 fn spectral_pass(
     image: ArrayView3<f32>,
-    codebook: &Codebook,
+    profile: &ResolutionProfile,
     removal_fraction: f32,
     consistency_floor: f32,
 ) -> Array3<f32> {
@@ -132,19 +129,19 @@ fn spectral_pass(
     // Build combined carrier list with coherence and reference phase per carrier.
     let dark_carriers: Vec<(i32, i32, f32, f32)> = CARRIERS_DARK
         .iter()
-        .zip(codebook.dark.coherence.iter())
-        .zip(codebook.dark.ref_phases.iter())
+        .zip(profile.dark.coherence.iter())
+        .zip(profile.dark.ref_phases.iter())
         .map(|((&freq, &coh), &phase)| (freq.0, freq.1, coh, phase))
         .collect();
 
     let white_carriers: Vec<(i32, i32, f32, f32)> = CARRIERS_WHITE
         .iter()
-        .zip(codebook.white.coherence.iter())
-        .zip(codebook.white.ref_phases.iter())
+        .zip(profile.white.coherence.iter())
+        .zip(profile.white.ref_phases.iter())
         .map(|((&freq, &coh), &phase)| (freq.0, freq.1, coh, phase))
         .collect();
 
-    let size = codebook.image_size;
+    let size = profile.image_size;
 
     for (ch, &weight) in CHANNEL_WEIGHTS.iter().enumerate() {
         let channel = image.slice(s![.., .., ch]);
