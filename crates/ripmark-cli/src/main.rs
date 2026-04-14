@@ -7,7 +7,7 @@ use image::{ImageBuffer, Luma, RgbImage};
 use ndarray::{Array2, Array3};
 use ripmark_core::analysis::{analyze_image_set, top_coherent_bins};
 use ripmark_core::bypass::{bypass, BypassMode};
-use ripmark_core::codebook::Codebook;
+use ripmark_core::codebook::{Codebook, ResolutionProfile};
 use ripmark_core::detect::{detect, BestSet};
 use serde::Serialize;
 
@@ -43,7 +43,16 @@ enum Command {
 
     /// Build a codebook from a directory of watermarked images
     Extract {
-        image_dir: PathBuf,
+        image_dir: Option<PathBuf>,
+        /// Black reference images directory
+        #[arg(long)]
+        black: Option<PathBuf>,
+        /// White reference images directory
+        #[arg(long)]
+        white: Option<PathBuf>,
+        /// Watermarked image directories; each directory adds one profile
+        #[arg(long)]
+        watermarked: Vec<PathBuf>,
         #[arg(long)]
         output: PathBuf,
         #[arg(long, default_value = "250")]
@@ -99,6 +108,8 @@ struct ExtractOutput {
     requested_scales: Vec<u32>,
     codebook_version: u32,
     resolutions: Vec<String>,
+    profiles_added: Vec<String>,
+    mode: String,
     detection_threshold: f32,
     correlation_mean: f32,
     correlation_std: f32,
@@ -168,10 +179,23 @@ fn main() -> Result<()> {
         } => run_detect(verbose, json, &image, &codebook, threshold),
         Command::Extract {
             image_dir,
+            black,
+            white,
+            watermarked,
             output,
             max_images,
             scales,
-        } => run_extract(verbose, json, &image_dir, &output, max_images, &scales),
+        } => run_extract(
+            verbose,
+            json,
+            image_dir.as_deref(),
+            black.as_deref(),
+            white.as_deref(),
+            &watermarked,
+            &output,
+            max_images,
+            &scales,
+        ),
         Command::Bypass {
             image,
             codebook,
@@ -248,33 +272,16 @@ fn run_detect(
 fn run_extract(
     verbose: bool,
     json: bool,
-    image_dir: &Path,
+    image_dir: Option<&Path>,
+    black_dir: Option<&Path>,
+    white_dir: Option<&Path>,
+    watermarked_dirs: &[PathBuf],
     output_path: &Path,
     max_images: usize,
     scales: &[u32],
 ) -> Result<()> {
-    let image_paths = collect_image_paths(image_dir, usize::MAX)?;
-    let (profile_height, profile_width) = image_dimensions(&image_paths[0])?;
-    let filtered_paths: Vec<PathBuf> = image_paths
-        .into_iter()
-        .filter(|path| {
-            image_dimensions(path)
-                .map(|dims| dims == (profile_height, profile_width))
-                .unwrap_or(false)
-        })
-        .take(max_images)
-        .collect();
-    if filtered_paths.is_empty() {
-        bail!(
-            "no images matching resolution {}x{} found in {}",
-            profile_height,
-            profile_width,
-            image_dir.display()
-        );
-    }
-
-    let images = load_images(&filtered_paths)?;
     let image_size = choose_extract_size(scales);
+    let mut added_profiles = Vec::new();
 
     if let Some(parent) = output_path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -283,24 +290,66 @@ fn run_extract(
         }
     }
 
-    let profile = Codebook::build_profile(&images, profile_height, profile_width, image_size);
     let mut codebook = if output_path.exists() {
         Codebook::load(output_path)?
     } else {
         Codebook {
             version: 2,
-            source: image_dir.display().to_string(),
+            source: image_dir
+                .or(black_dir)
+                .or_else(|| watermarked_dirs.first().map(|p| p.as_path()))
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| ".".to_string()),
             profiles: Vec::new(),
         }
     };
-    codebook.add_profile(profile.clone());
+
+    if black_dir.is_some() || white_dir.is_some() {
+        let black_dir = black_dir.context("reference extraction requires --black")?;
+        let (profile, used_count) =
+            build_reference_profile(black_dir, white_dir, max_images, image_size)?;
+        let resolution = format!("{}x{}", profile.height, profile.width);
+        codebook.add_profile(profile.clone());
+        added_profiles.push((profile, used_count, format!("references:{resolution}")));
+    }
+
+    if let Some(image_dir) = image_dir {
+        let (profile, used_count) = build_watermarked_profile(image_dir, max_images, image_size)?;
+        let resolution = format!("{}x{}", profile.height, profile.width);
+        codebook.add_profile(profile.clone());
+        added_profiles.push((profile, used_count, format!("watermarked:{resolution}")));
+    }
+
+    for dir in watermarked_dirs {
+        let (profile, used_count) = build_watermarked_profile(dir, max_images, image_size)?;
+        let resolution = format!("{}x{}", profile.height, profile.width);
+        codebook.add_profile(profile.clone());
+        added_profiles.push((profile, used_count, format!("watermarked:{resolution}")));
+    }
+
+    if added_profiles.is_empty() {
+        bail!("provide an image_dir, --black, or one or more --watermarked directories");
+    }
+
     codebook.save(output_path)?;
+    let primary = added_profiles
+        .last()
+        .map(|(profile, _, _)| profile)
+        .expect("added_profiles is non-empty");
 
     let output = ExtractOutput {
-        image_dir: image_dir.display().to_string(),
+        image_dir: image_dir
+            .map(|path| path.display().to_string())
+            .or(black_dir.map(|path| path.display().to_string()))
+            .or_else(|| {
+                watermarked_dirs
+                    .first()
+                    .map(|path| path.display().to_string())
+            })
+            .unwrap_or_else(|| ".".to_string()),
         output: output_path.display().to_string(),
-        profile_resolution: format!("{}x{}", profile.height, profile.width),
-        n_images: images.len(),
+        profile_resolution: format!("{}x{}", primary.height, primary.width),
+        n_images: added_profiles.iter().map(|(_, n, _)| *n).sum(),
         image_size,
         requested_scales: scales.to_vec(),
         codebook_version: codebook.version,
@@ -309,15 +358,21 @@ fn run_extract(
             .into_iter()
             .map(|(h, w)| format!("{h}x{w}"))
             .collect(),
-        detection_threshold: profile.detection_threshold,
-        correlation_mean: profile.correlation_mean,
-        correlation_std: profile.correlation_std,
+        profiles_added: added_profiles
+            .iter()
+            .map(|(_, _, label)| label.clone())
+            .collect(),
+        mode: extract_mode_label(image_dir, black_dir, white_dir, watermarked_dirs),
+        detection_threshold: primary.detection_threshold,
+        correlation_mean: primary.correlation_mean,
+        correlation_std: primary.correlation_std,
     };
 
     if json {
         print_json(&output)?;
     } else {
         println!("extracted codebook: {}", output.output);
+        println!("mode:               {}", output.mode);
         println!("profile_resolution: {}", output.profile_resolution);
         println!("images:             {}", output.n_images);
         println!("image_size:         {}", output.image_size);
@@ -325,6 +380,7 @@ fn run_extract(
         if verbose {
             println!("version:            {}", output.codebook_version);
             println!("resolutions:        {}", output.resolutions.join(", "));
+            println!("profiles_added:     {}", output.profiles_added.join(", "));
             println!("detection_threshold:{:.4}", output.detection_threshold);
             println!("correlation_mean:   {:.4}", output.correlation_mean);
             println!("correlation_std:    {:.4}", output.correlation_std);
@@ -541,8 +597,79 @@ fn collect_image_paths(dir: &Path, max_images: usize) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+fn collect_same_resolution_image_paths(dir: &Path, max_images: usize) -> Result<Vec<PathBuf>> {
+    let image_paths = collect_image_paths(dir, usize::MAX)?;
+    let (height, width) = image_dimensions(&image_paths[0])?;
+    let filtered: Vec<PathBuf> = image_paths
+        .into_iter()
+        .filter(|path| {
+            image_dimensions(path)
+                .map(|dims| dims == (height, width))
+                .unwrap_or(false)
+        })
+        .take(max_images)
+        .collect();
+
+    if filtered.is_empty() {
+        bail!(
+            "no images matching resolution {}x{} found in {}",
+            height,
+            width,
+            dir.display()
+        );
+    }
+
+    Ok(filtered)
+}
+
 fn load_images(paths: &[PathBuf]) -> Result<Vec<Array3<f32>>> {
     paths.iter().map(|path| load_rgb_image(path)).collect()
+}
+
+fn build_watermarked_profile(
+    dir: &Path,
+    max_images: usize,
+    image_size: usize,
+) -> Result<(ResolutionProfile, usize)> {
+    let image_paths = collect_same_resolution_image_paths(dir, max_images)?;
+    let (height, width) = image_dimensions(&image_paths[0])?;
+    let images = load_images(&image_paths)?;
+    Ok((
+        Codebook::build_profile(&images, height, width, image_size),
+        images.len(),
+    ))
+}
+
+fn build_reference_profile(
+    black_dir: &Path,
+    white_dir: Option<&Path>,
+    max_images: usize,
+    image_size: usize,
+) -> Result<(ResolutionProfile, usize)> {
+    let black_paths = collect_same_resolution_image_paths(black_dir, max_images)?;
+    let (height, width) = image_dimensions(&black_paths[0])?;
+    let mut images = load_images(&black_paths)?;
+    let mut count = images.len();
+
+    if let Some(white_dir) = white_dir {
+        let white_paths = collect_same_resolution_image_paths(white_dir, max_images)?;
+        let white_images = load_images(&white_paths)?;
+        for image in white_images {
+            if image.dim().0 == height && image.dim().1 == width {
+                images.push(invert_rgb(&image));
+                count += 1;
+            }
+        }
+    }
+
+    if images.is_empty() {
+        bail!("no usable reference images found");
+    }
+
+    Ok((
+        Codebook::build_profile(&images, height, width, image_size),
+        count,
+    ))
 }
 
 fn image_dimensions(path: &Path) -> Result<(usize, usize)> {
@@ -562,6 +689,10 @@ fn load_rgb_image(path: &Path) -> Result<Array3<f32>> {
 
     Array3::from_shape_vec((h as usize, w as usize, 3), data)
         .with_context(|| format!("failed to map image array for {}", path.display()))
+}
+
+fn invert_rgb(image: &Array3<f32>) -> Array3<f32> {
+    image.mapv(|v| 1.0 - v)
 }
 
 fn save_rgb_image(path: &Path, image: &Array3<f32>) -> Result<()> {
@@ -635,6 +766,33 @@ fn is_supported_image(path: &Path) -> bool {
 
 fn choose_extract_size(scales: &[u32]) -> usize {
     scales.iter().copied().max().unwrap_or(512).min(4096) as usize
+}
+
+fn extract_mode_label(
+    image_dir: Option<&Path>,
+    black_dir: Option<&Path>,
+    white_dir: Option<&Path>,
+    watermarked_dirs: &[PathBuf],
+) -> String {
+    let mut parts = Vec::new();
+    if image_dir.is_some() {
+        parts.push("single_dir");
+    }
+    if black_dir.is_some() {
+        parts.push(if white_dir.is_some() {
+            "black_white_refs"
+        } else {
+            "black_refs"
+        });
+    }
+    if !watermarked_dirs.is_empty() {
+        parts.push("watermarked_dirs");
+    }
+    if parts.is_empty() {
+        "none".to_string()
+    } else {
+        parts.join("+")
+    }
 }
 
 fn parse_bypass_mode(mode: &str) -> Result<BypassMode> {
