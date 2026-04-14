@@ -20,8 +20,9 @@ use image::{DynamicImage, ImageFormat, RgbImage};
 use ndarray::{s, Array3, ArrayView3};
 use rustfft::num_complex::Complex;
 
-use crate::carriers::{CARRIERS_DARK, CARRIERS_WHITE};
+use crate::carriers::{all_carriers, CARRIERS_DARK, CARRIERS_WHITE};
 use crate::codebook::{Codebook, ResolutionProfile};
+use crate::detect::detect;
 use crate::fft::{fft2, Spectrum};
 
 /// Which removal strategy to use.
@@ -40,6 +41,18 @@ pub enum BypassMode {
 pub struct BypassResult {
     /// Processed image, RGB values in [0, 1].
     pub image: Array3<f32>,
+    /// Peak signal-to-noise ratio against the original image.
+    pub psnr: f32,
+    /// Block SSIM approximation against the original image.
+    pub ssim: f32,
+    /// Relative drop in carrier-band energy, in [0, 1] when the energy falls.
+    pub carrier_energy_drop: f32,
+    /// Relative drop in phase match against the reference carrier template.
+    pub phase_coherence_drop: f32,
+    /// Resolution profile chosen from the codebook.
+    pub profile_resolution: (usize, usize),
+    /// Whether the selected profile exactly matched the input image dimensions.
+    pub exact_profile_match: bool,
     /// Names of stages applied (for logging).
     pub stages: Vec<String>,
 }
@@ -52,28 +65,49 @@ pub fn bypass(
     codebook: &Codebook,
     mode: BypassMode,
 ) -> Result<BypassResult> {
-    match mode {
-        BypassMode::V1 => v1(image),
-        BypassMode::V2 => v2(image),
-        BypassMode::V3 => v3(image, codebook),
-    }
+    let (profile, exact_match) = codebook.best_profile(image.shape()[0], image.shape()[1])?;
+
+    let image_out = match mode {
+        BypassMode::V1 => v1(image)?,
+        BypassMode::V2 => v2(image)?,
+        BypassMode::V3 => v3(image, profile)?,
+    };
+
+    let before_detection = detect(image, codebook);
+    let after_detection = detect(image_out.image.view(), codebook);
+    let before_energy = carrier_energy(image, profile);
+    let after_energy = carrier_energy(image_out.image.view(), profile);
+
+    Ok(BypassResult {
+        psnr: compute_psnr(image, image_out.image.view()),
+        ssim: compute_ssim(image, image_out.image.view()),
+        carrier_energy_drop: relative_drop(before_energy, after_energy),
+        phase_coherence_drop: relative_drop(
+            before_detection.phase_match,
+            after_detection.phase_match,
+        ),
+        profile_resolution: (profile.height, profile.width),
+        exact_profile_match: exact_match,
+        image: image_out.image,
+        stages: image_out.stages,
+    })
 }
 
 // V1: JPEG quality cycling.
-fn v1(image: ArrayView3<f32>) -> Result<BypassResult> {
+fn v1(image: ArrayView3<f32>) -> Result<IntermediateBypassResult> {
     let cycled = jpeg_cycle(image, 50)?;
-    Ok(BypassResult {
+    Ok(IntermediateBypassResult {
         image: cycled,
         stages: vec!["jpeg_cycle_q50".into()],
     })
 }
 
 // V2: noise injection + bilateral smoothing + V1.
-fn v2(image: ArrayView3<f32>) -> Result<BypassResult> {
+fn v2(image: ArrayView3<f32>) -> Result<IntermediateBypassResult> {
     let noisy = add_gaussian_noise(image, 5.0);
     let smoothed = bilateral_smooth(noisy.view(), 9, 75.0, 75.0);
-    let BypassResult { image: cycled, .. } = v1(smoothed.view())?;
-    Ok(BypassResult {
+    let IntermediateBypassResult { image: cycled, .. } = v1(smoothed.view())?;
+    Ok(IntermediateBypassResult {
         image: cycled,
         stages: vec![
             "noise_injection".into(),
@@ -84,9 +118,7 @@ fn v2(image: ArrayView3<f32>) -> Result<BypassResult> {
 }
 
 // V3: multi-pass spectral subtraction.
-fn v3(image: ArrayView3<f32>, codebook: &Codebook) -> Result<BypassResult> {
-    let (profile, _) = codebook.best_profile(image.shape()[0], image.shape()[1])?;
-
+fn v3(image: ArrayView3<f32>, profile: &ResolutionProfile) -> Result<IntermediateBypassResult> {
     // Three passes with decreasing aggressiveness.
     // (removal_fraction, consistency_floor)
     let passes: &[(f32, f32)] = &[(0.95, 0.30), (0.80, 0.50), (0.60, 0.70)];
@@ -100,7 +132,7 @@ fn v3(image: ArrayView3<f32>, codebook: &Codebook) -> Result<BypassResult> {
     // Light Gaussian blur to smooth any spectral artefacts.
     current = gaussian_blur(current.view(), 0.4);
 
-    Ok(BypassResult {
+    Ok(IntermediateBypassResult {
         image: current,
         stages: vec![
             "spectral_pass_aggressive".into(),
@@ -109,6 +141,12 @@ fn v3(image: ArrayView3<f32>, codebook: &Codebook) -> Result<BypassResult> {
             "gaussian_antialias".into(),
         ],
     })
+}
+
+#[derive(Debug, Clone)]
+struct IntermediateBypassResult {
+    image: Array3<f32>,
+    stages: Vec<String>,
 }
 
 // Single spectral subtraction pass over all channels and carrier sets.
@@ -339,6 +377,118 @@ fn gaussian_blur(image: ArrayView3<f32>, sigma: f32) -> Array3<f32> {
     }
 
     out
+}
+
+fn carrier_energy(image: ArrayView3<f32>, profile: &ResolutionProfile) -> f32 {
+    let size = profile.image_size;
+    let center = size as i32 / 2;
+    let resized = crate::fft::resize_rgb(&image.to_owned(), size, size);
+    let noise = crate::denoise::extract_noise_fused(resized.view());
+    let noise_gray = crate::fft::to_grayscale(noise.view());
+    let noise_spectrum = crate::fft::fftshift(fft2(noise_gray.view()).data);
+    let noise_mag = noise_spectrum.mapv(|c| c.norm());
+
+    let carrier_mags: Vec<f32> = all_carriers()
+        .into_iter()
+        .filter_map(|(fy, fx)| {
+            let y = (fy + center) as usize;
+            let x = (fx + center) as usize;
+            if y < size && x < size {
+                Some(noise_mag[[y, x]])
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    mean(&carrier_mags)
+}
+
+fn compute_psnr(original: ArrayView3<f32>, modified: ArrayView3<f32>) -> f32 {
+    let mse = original
+        .iter()
+        .zip(modified.iter())
+        .map(|(&a, &b)| {
+            let d = a - b;
+            d * d
+        })
+        .sum::<f32>()
+        / original.len() as f32;
+
+    if mse <= 1e-12 {
+        f32::INFINITY
+    } else {
+        10.0 * (1.0 / mse).log10()
+    }
+}
+
+fn compute_ssim(original: ArrayView3<f32>, modified: ArrayView3<f32>) -> f32 {
+    let gray_o = crate::fft::to_grayscale(original);
+    let gray_m = crate::fft::to_grayscale(modified);
+    let block = 8usize;
+    let rows = gray_o.nrows() / block * block;
+    let cols = gray_o.ncols() / block * block;
+
+    if rows == 0 || cols == 0 {
+        return 1.0;
+    }
+
+    let k1_sq = 0.0001_f32;
+    let k2_sq = 0.0009_f32;
+    let mut scores = Vec::new();
+
+    for by in (0..rows).step_by(block) {
+        for bx in (0..cols).step_by(block) {
+            let mut sum_a = 0.0_f32;
+            let mut sum_b = 0.0_f32;
+            let mut sum_aa = 0.0_f32;
+            let mut sum_bb = 0.0_f32;
+            let mut sum_ab = 0.0_f32;
+
+            for y in by..(by + block) {
+                for x in bx..(bx + block) {
+                    let a = gray_o[[y, x]];
+                    let b = gray_m[[y, x]];
+                    sum_a += a;
+                    sum_b += b;
+                    sum_aa += a * a;
+                    sum_bb += b * b;
+                    sum_ab += a * b;
+                }
+            }
+
+            let n = (block * block) as f32;
+            let mu_a = sum_a / n;
+            let mu_b = sum_b / n;
+            let var_a = sum_aa / n - mu_a * mu_a;
+            let var_b = sum_bb / n - mu_b * mu_b;
+            let cov_ab = sum_ab / n - mu_a * mu_b;
+
+            let num = (2.0 * mu_a * mu_b + k1_sq) * (2.0 * cov_ab + k2_sq);
+            let den = (mu_a * mu_a + mu_b * mu_b + k1_sq) * (var_a + var_b + k2_sq);
+            if den.abs() > 1e-12 {
+                scores.push(num / den);
+            }
+        }
+    }
+
+    mean(&scores)
+}
+
+fn relative_drop(before: f32, after: f32) -> f32 {
+    if before.abs() < 1e-10 {
+        0.0
+    } else {
+        ((before - after) / before).clamp(-10.0, 10.0)
+    }
+}
+
+fn mean(values: &[f32]) -> f32 {
+    if values.is_empty() {
+        0.0
+    } else {
+        values.iter().sum::<f32>() / values.len() as f32
+    }
 }
 
 #[cfg(test)]

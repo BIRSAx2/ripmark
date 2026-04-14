@@ -110,6 +110,12 @@ struct BypassOutput {
     output: String,
     codebook: String,
     mode: String,
+    selected_profile: String,
+    exact_profile_match: bool,
+    psnr: f32,
+    ssim: f32,
+    carrier_energy_drop: f32,
+    phase_coherence_drop: f32,
     stages: Vec<String>,
 }
 
@@ -135,9 +141,18 @@ struct AnalyzeSummary {
     output_dir: String,
     n_images: usize,
     image_size: usize,
+    overall_phase_coherence: f32,
     top_carriers: Vec<AnalyzeCarrier>,
     top_coherent_bins: Vec<AnalyzeTopBin>,
     files_written: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AnalyzeProfiles {
+    vertical_magnitude: Vec<f32>,
+    vertical_coherence: Vec<f32>,
+    radial_magnitude: Vec<f32>,
+    radial_coherence: Vec<f32>,
 }
 
 fn main() -> Result<()> {
@@ -345,6 +360,15 @@ fn run_bypass(
         output: output_path.display().to_string(),
         codebook: codebook_path.display().to_string(),
         mode: bypass_mode_label(mode).to_string(),
+        selected_profile: format!(
+            "{}x{}",
+            result.profile_resolution.0, result.profile_resolution.1
+        ),
+        exact_profile_match: result.exact_profile_match,
+        psnr: result.psnr,
+        ssim: result.ssim,
+        carrier_energy_drop: result.carrier_energy_drop,
+        phase_coherence_drop: result.phase_coherence_drop,
         stages: result.stages,
     };
 
@@ -353,6 +377,19 @@ fn run_bypass(
     } else {
         println!("wrote bypassed image: {}", output.output);
         println!("mode:                {}", output.mode);
+        println!(
+            "profile:             {}{}",
+            output.selected_profile,
+            if output.exact_profile_match {
+                ""
+            } else {
+                " (fallback)"
+            }
+        );
+        println!("psnr:                {:.3}", output.psnr);
+        println!("ssim:                {:.4}", output.ssim);
+        println!("carrier_energy_drop: {:.4}", output.carrier_energy_drop);
+        println!("phase_coherence_drop:{:.4}", output.phase_coherence_drop);
         if verbose {
             println!("stages:              {}", output.stages.join(", "));
         }
@@ -369,10 +406,15 @@ fn run_analyze(verbose: bool, json: bool, image_dir: &Path, output_dir: &Path) -
     fs::create_dir_all(output_dir)
         .with_context(|| format!("failed to create {}", output_dir.display()))?;
 
+    let report_path = output_dir.join("report.json");
     let summary_path = output_dir.join("summary.json");
+    let top_carriers_path = output_dir.join("top_carriers.json");
+    let top_bins_path = output_dir.join("top_coherent_bins.json");
+    let profiles_path = output_dir.join("profiles.json");
     let magnitude_path = output_dir.join("magnitude_spectrum.png");
     let coherence_path = output_dir.join("phase_coherence_map.png");
     let pca_path = output_dir.join("pca_watermark.png");
+    let carrier_mask_path = output_dir.join("carrier_mask.png");
 
     save_heatmap(&magnitude_path, &report.magnitude_spectrum)?;
     save_heatmap(&coherence_path, &report.phase_coherence_map)?;
@@ -385,45 +427,80 @@ fn run_analyze(verbose: bool, json: bool, image_dir: &Path, output_dir: &Path) -
         5,
     );
 
+    let top_carriers: Vec<AnalyzeCarrier> = report
+        .top_carriers
+        .iter()
+        .take(20)
+        .map(|carrier| AnalyzeCarrier {
+            freq: carrier.freq,
+            magnitude: carrier.magnitude,
+            phase: carrier.phase,
+            coherence: carrier.coherence,
+            votes: carrier.votes,
+            score: carrier.score,
+        })
+        .collect();
+    let top_coherent_bins: Vec<AnalyzeTopBin> = top_bins
+        .iter()
+        .map(|(freq, score)| AnalyzeTopBin {
+            freq: *freq,
+            score: *score,
+        })
+        .collect();
+    let profiles = AnalyzeProfiles {
+        vertical_magnitude: vertical_profile(&report.magnitude_spectrum),
+        vertical_coherence: vertical_profile(&report.phase_coherence_map),
+        radial_magnitude: radial_profile(&report.magnitude_spectrum),
+        radial_coherence: radial_profile(&report.phase_coherence_map),
+    };
+    let overall_phase_coherence = mean_f32(report.phase_coherence_map.iter().copied());
+    save_carrier_mask(&carrier_mask_path, report.image_size, &top_carriers)?;
+
     let summary = AnalyzeSummary {
         image_dir: image_dir.display().to_string(),
         output_dir: output_dir.display().to_string(),
         n_images: images.len(),
         image_size: report.image_size,
-        top_carriers: report
-            .top_carriers
-            .iter()
-            .take(20)
-            .map(|carrier| AnalyzeCarrier {
-                freq: carrier.freq,
-                magnitude: carrier.magnitude,
-                phase: carrier.phase,
-                coherence: carrier.coherence,
-                votes: carrier.votes,
-                score: carrier.score,
-            })
-            .collect(),
-        top_coherent_bins: top_bins
-            .into_iter()
-            .map(|(freq, score)| AnalyzeTopBin { freq, score })
-            .collect(),
+        overall_phase_coherence,
+        top_carriers,
+        top_coherent_bins,
         files_written: vec![
+            report_path.display().to_string(),
             summary_path.display().to_string(),
+            top_carriers_path.display().to_string(),
+            top_bins_path.display().to_string(),
+            profiles_path.display().to_string(),
             magnitude_path.display().to_string(),
             coherence_path.display().to_string(),
             pca_path.display().to_string(),
+            carrier_mask_path.display().to_string(),
         ],
     };
 
+    fs::write(&report_path, serde_json::to_vec_pretty(&summary)?)
+        .with_context(|| format!("failed to write {}", report_path.display()))?;
     fs::write(&summary_path, serde_json::to_vec_pretty(&summary)?)
         .with_context(|| format!("failed to write {}", summary_path.display()))?;
+    fs::write(
+        &top_carriers_path,
+        serde_json::to_vec_pretty(&summary.top_carriers)?,
+    )
+    .with_context(|| format!("failed to write {}", top_carriers_path.display()))?;
+    fs::write(
+        &top_bins_path,
+        serde_json::to_vec_pretty(&summary.top_coherent_bins)?,
+    )
+    .with_context(|| format!("failed to write {}", top_bins_path.display()))?;
+    fs::write(&profiles_path, serde_json::to_vec_pretty(&profiles)?)
+        .with_context(|| format!("failed to write {}", profiles_path.display()))?;
 
     if json {
         print_json(&summary)?;
     } else {
         println!("analyzed images: {}", summary.n_images);
         println!("output_dir:      {}", summary.output_dir);
-        println!("summary:         {}", summary_path.display());
+        println!("report:          {}", report_path.display());
+        println!("phase_coherence: {:.4}", summary.overall_phase_coherence);
         if verbose {
             println!("files:");
             for file in &summary.files_written {
@@ -528,6 +605,25 @@ fn save_heatmap(path: &Path, map: &Array2<f32>) -> Result<()> {
         .with_context(|| format!("failed to save heatmap {}", path.display()))
 }
 
+fn save_carrier_mask(path: &Path, image_size: usize, carriers: &[AnalyzeCarrier]) -> Result<()> {
+    let center = image_size as i32 / 2;
+    let mut raw = vec![0u8; image_size * image_size];
+    for carrier in carriers {
+        let y = carrier.freq.0 + center;
+        let x = carrier.freq.1 + center;
+        if (0..image_size as i32).contains(&y) && (0..image_size as i32).contains(&x) {
+            raw[y as usize * image_size + x as usize] = 255;
+        }
+    }
+
+    let buffer: ImageBuffer<Luma<u8>, Vec<u8>> =
+        ImageBuffer::from_raw(image_size as u32, image_size as u32, raw)
+            .ok_or_else(|| anyhow::anyhow!("failed to construct carrier mask buffer"))?;
+    buffer
+        .save(path)
+        .with_context(|| format!("failed to save carrier mask {}", path.display()))
+}
+
 fn is_supported_image(path: &Path) -> bool {
     matches!(
         path.extension()
@@ -568,4 +664,51 @@ fn best_set_label(best_set: BestSet) -> &'static str {
 fn print_json<T: Serialize>(value: &T) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
+}
+
+fn vertical_profile(map: &Array2<f32>) -> Vec<f32> {
+    let cx = map.ncols() / 2;
+    (0..map.nrows()).map(|y| map[[y, cx]]).collect()
+}
+
+fn radial_profile(map: &Array2<f32>) -> Vec<f32> {
+    let h = map.nrows() as i32;
+    let w = map.ncols() as i32;
+    let cy = h / 2;
+    let cx = w / 2;
+    let max_r = cy.min(cx).max(0) as usize;
+    let mut sums = vec![0.0_f32; max_r + 1];
+    let mut counts = vec![0usize; max_r + 1];
+
+    for y in 0..h {
+        for x in 0..w {
+            let dy = y - cy;
+            let dx = x - cx;
+            let r = (((dy * dy + dx * dx) as f64).sqrt().round() as usize).min(max_r);
+            sums[r] += map[[y as usize, x as usize]];
+            counts[r] += 1;
+        }
+    }
+
+    sums.into_iter()
+        .zip(counts)
+        .map(|(sum, count)| if count == 0 { 0.0 } else { sum / count as f32 })
+        .collect()
+}
+
+fn mean_f32<I>(values: I) -> f32
+where
+    I: IntoIterator<Item = f32>,
+{
+    let mut sum = 0.0_f32;
+    let mut count = 0usize;
+    for value in values {
+        sum += value;
+        count += 1;
+    }
+    if count == 0 {
+        0.0
+    } else {
+        sum / count as f32
+    }
 }
