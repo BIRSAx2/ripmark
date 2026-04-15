@@ -96,6 +96,10 @@ struct DetectOutput {
     cvr_ratio: f32,
     phase_score: f32,
     cvr_score: f32,
+    correlation: f32,
+    structure_ratio: f32,
+    carrier_strength: f32,
+    multi_scale_consistency: f32,
 }
 
 #[derive(Debug, Serialize)]
@@ -236,6 +240,10 @@ fn run_detect(
         cvr_ratio: result.cvr_ratio,
         phase_score: result.phase_score,
         cvr_score: result.cvr_score,
+        correlation: result.correlation,
+        structure_ratio: result.structure_ratio,
+        carrier_strength: result.carrier_strength,
+        multi_scale_consistency: result.multi_scale_consistency,
     };
 
     if json {
@@ -263,6 +271,13 @@ fn run_detect(
             println!("white_phase_match: {:.3}", output.white_phase_match);
             println!("phase_score:       {:.3}", output.phase_score);
             println!("cvr_score:         {:.3}", output.cvr_score);
+            println!("correlation:       {:.3}", output.correlation);
+            println!("structure_ratio:   {:.3}", output.structure_ratio);
+            println!("carrier_strength:  {:.3}", output.carrier_strength);
+            println!(
+                "multi_scale_consistency: {:.3}",
+                output.multi_scale_consistency
+            );
         }
     }
 

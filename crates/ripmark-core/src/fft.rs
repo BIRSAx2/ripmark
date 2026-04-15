@@ -3,12 +3,28 @@
 //! Images are f32, row-major, channel-last (H x W x C).
 //! Spectra are row-major complex arrays (H x W).
 
+use std::sync::{Arc, Mutex, OnceLock};
+
 use ndarray::{Array2, Array3, ArrayView2, ArrayView3};
-use rustfft::{num_complex::Complex, FftPlanner};
+use rustfft::{num_complex::Complex, Fft, FftPlanner};
 
 /// A 2-D complex spectrum in standard FFT layout (zero-frequency at [0,0]).
 pub struct Spectrum {
     pub data: Array2<Complex<f32>>,
+}
+
+fn planner() -> &'static Mutex<FftPlanner<f32>> {
+    static PLANNER: OnceLock<Mutex<FftPlanner<f32>>> = OnceLock::new();
+    PLANNER.get_or_init(|| Mutex::new(FftPlanner::<f32>::new()))
+}
+
+fn fft_plan(len: usize, inverse: bool) -> Arc<dyn Fft<f32>> {
+    let mut planner = planner().lock().expect("fft planner mutex poisoned");
+    if inverse {
+        planner.plan_fft_inverse(len)
+    } else {
+        planner.plan_fft_forward(len)
+    }
 }
 
 impl Spectrum {
@@ -53,18 +69,17 @@ impl Spectrum {
 pub fn fft2(input: ArrayView2<f32>) -> Spectrum {
     let h = input.nrows();
     let w = input.ncols();
-    let mut planner = FftPlanner::<f32>::new();
 
     let mut buf: Vec<Complex<f32>> = input.iter().map(|&x| Complex::new(x, 0.0)).collect();
 
     // Forward FFT along rows.
-    let row_plan = planner.plan_fft_forward(w);
+    let row_plan = fft_plan(w, false);
     for row in buf.chunks_mut(w) {
         row_plan.process(row);
     }
 
     // Forward FFT along columns: extract each column, transform, put back.
-    let col_plan = planner.plan_fft_forward(h);
+    let col_plan = fft_plan(h, false);
     let mut col = vec![Complex::new(0.0f32, 0.0); h];
     for c in 0..w {
         for r in 0..h {
@@ -183,15 +198,14 @@ pub fn resize_rgb(src: &Array3<f32>, out_h: usize, out_w: usize) -> Array3<f32> 
 fn ifft2(data: Array2<Complex<f32>>) -> Array2<f32> {
     let h = data.nrows();
     let w = data.ncols();
-    let mut planner = FftPlanner::<f32>::new();
     let mut buf: Vec<Complex<f32>> = data.into_iter().collect();
 
-    let row_plan = planner.plan_fft_inverse(w);
+    let row_plan = fft_plan(w, true);
     for row in buf.chunks_mut(w) {
         row_plan.process(row);
     }
 
-    let col_plan = planner.plan_fft_inverse(h);
+    let col_plan = fft_plan(h, true);
     let mut col = vec![Complex::new(0.0f32, 0.0); h];
     for c in 0..w {
         for r in 0..h {

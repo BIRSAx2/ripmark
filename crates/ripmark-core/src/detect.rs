@@ -46,6 +46,14 @@ pub struct DetectionResult {
     pub phase_score: f32,
     /// Intermediate sigmoid score for CVR ratio.
     pub cvr_score: f32,
+    /// Correlation between the image noise residual and the reference noise.
+    pub correlation: f32,
+    /// Ratio of noise standard deviation to average absolute noise magnitude.
+    pub structure_ratio: f32,
+    /// Mean image-domain FFT magnitude at all known carrier bins.
+    pub carrier_strength: f32,
+    /// Placeholder for the Python extractor's multi-scale consistency metric.
+    pub multi_scale_consistency: f32,
 }
 
 /// Detect a SynthID watermark in an image.
@@ -68,6 +76,7 @@ fn detect_with_profile(image: ArrayView3<f32>, profile: &ResolutionProfile) -> D
     let gray = to_grayscale(resized.view());
     let spectrum = fftshift(fft2(gray.view()).data);
     let img_phase = spectrum.mapv(|c| c.arg());
+    let img_mag = spectrum.mapv(|c| c.norm());
 
     // Phase match for each carrier set.
     let dark_phase_match = phase_match(
@@ -94,6 +103,22 @@ fn detect_with_profile(image: ArrayView3<f32>, profile: &ResolutionProfile) -> D
     // CVR ratio from the noise residual.
     let cvr_ratio = carrier_to_random_ratio(resized.view(), &all_carriers(), center, size);
 
+    // Legacy reporting metrics for parity with the Python extractor.
+    let noise = extract_noise_fused(resized.view());
+    let reference_noise = profile.reference_noise_array();
+    let correlation = pearson_correlation(
+        noise.iter().copied().collect::<Vec<_>>().as_slice(),
+        reference_noise
+            .iter()
+            .copied()
+            .collect::<Vec<_>>()
+            .as_slice(),
+    );
+    let noise_gray = crate::fft::to_grayscale(noise.view());
+    let structure_ratio = structure_ratio(&noise_gray);
+    let carrier_strength = mean_carrier_strength(&img_mag, &all_carriers(), center, size);
+    let multi_scale_consistency = 0.0;
+
     // Sigmoid scoring. Positive argument = high value gives high score.
     // Threshold 0.78 sits between max non-watermarked (0.71) and min watermarked (0.92).
     let phase_score = sigmoid(20.0 * (best_phase_match - 0.78));
@@ -112,6 +137,10 @@ fn detect_with_profile(image: ArrayView3<f32>, profile: &ResolutionProfile) -> D
         cvr_ratio,
         phase_score,
         cvr_score,
+        correlation,
+        structure_ratio,
+        carrier_strength,
+        multi_scale_consistency,
     }
 }
 
@@ -222,6 +251,73 @@ fn mean(values: &[f32]) -> f32 {
         return 0.0;
     }
     values.iter().sum::<f32>() / values.len() as f32
+}
+
+fn mean_carrier_strength(
+    image_mag: &ndarray::Array2<f32>,
+    carriers: &[(i32, i32)],
+    center: i32,
+    size: usize,
+) -> f32 {
+    let carrier_mags: Vec<f32> = carriers
+        .iter()
+        .filter_map(|&(fy, fx)| {
+            let y = (fy + center) as usize;
+            let x = (fx + center) as usize;
+            if y < size && x < size {
+                Some(image_mag[[y, x]])
+            } else {
+                None
+            }
+        })
+        .collect();
+    mean(&carrier_mags)
+}
+
+fn structure_ratio(noise_gray: &ndarray::Array2<f32>) -> f32 {
+    let values: Vec<f32> = noise_gray.iter().copied().collect();
+    let mean_abs = values.iter().map(|v| v.abs()).sum::<f32>() / values.len().max(1) as f32;
+    let mean = values.iter().sum::<f32>() / values.len().max(1) as f32;
+    let variance = values
+        .iter()
+        .map(|&v| {
+            let d = v - mean;
+            d * d
+        })
+        .sum::<f32>()
+        / values.len().max(1) as f32;
+    variance.sqrt() / (mean_abs + 1e-10)
+}
+
+fn pearson_correlation(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+
+    let n = a.len() as f32;
+    let mean_a = a.iter().sum::<f32>() / n;
+    let mean_b = b.iter().sum::<f32>() / n;
+
+    let (mut num, mut den_a, mut den_b) = (0.0_f32, 0.0_f32, 0.0_f32);
+    for (&ai, &bi) in a.iter().zip(b.iter()) {
+        let da = ai - mean_a;
+        let db = bi - mean_b;
+        num += da * db;
+        den_a += da * da;
+        den_b += db * db;
+    }
+
+    let denom = (den_a * den_b).sqrt();
+    if denom < 1e-10 || !denom.is_finite() {
+        0.0
+    } else {
+        let corr = num / denom;
+        if corr.is_finite() {
+            corr
+        } else {
+            0.0
+        }
+    }
 }
 
 #[cfg(test)]
