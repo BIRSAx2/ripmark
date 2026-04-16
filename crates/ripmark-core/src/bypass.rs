@@ -23,7 +23,7 @@ use rustfft::num_complex::Complex;
 use crate::carriers::{all_carriers, CARRIERS_DARK, CARRIERS_WHITE};
 use crate::codebook::{Codebook, ResolutionProfile};
 use crate::detect::detect;
-use crate::fft::{fft2, Spectrum};
+use crate::fft::{fft2, resize_gray, Spectrum};
 
 /// Which removal strategy to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,14 +119,16 @@ fn v2(image: ArrayView3<f32>) -> Result<IntermediateBypassResult> {
 
 // V3: multi-pass spectral subtraction.
 fn v3(image: ArrayView3<f32>, profile: &ResolutionProfile) -> Result<IntermediateBypassResult> {
-    // Three passes with decreasing aggressiveness.
-    // (removal_fraction, consistency_floor)
-    let passes: &[(f32, f32)] = &[(0.95, 0.30), (0.80, 0.50), (0.60, 0.70)];
-
     let mut current = image.to_owned();
+    let avg_luminance = current.iter().copied().sum::<f32>() / (current.len() as f32);
+    let passes = [
+        StrengthConfig::aggressive(),
+        StrengthConfig::moderate(),
+        StrengthConfig::gentle(),
+    ];
 
-    for &(removal_fraction, consistency_floor) in passes {
-        current = spectral_pass(current.view(), profile, removal_fraction, consistency_floor);
+    for pass in passes {
+        current = spectral_pass(current.view(), profile, avg_luminance, pass);
     }
 
     // Light Gaussian blur to smooth any spectral artefacts.
@@ -153,25 +155,134 @@ struct IntermediateBypassResult {
 fn spectral_pass(
     image: ArrayView3<f32>,
     profile: &ResolutionProfile,
+    avg_luminance: f32,
+    cfg: StrengthConfig,
+) -> Array3<f32> {
+    let h = image.shape()[0];
+    let w = image.shape()[1];
+    let spectral_ready = spectral_profile_is_reliable(profile)
+        && profile.height == h
+        && profile.width == w
+        && profile.magnitude_profile.is_some()
+        && profile.phase_template.is_some()
+        && profile.phase_consistency.is_some();
+
+    if spectral_ready {
+        spectral_pass_exact(image, profile, avg_luminance, cfg)
+    } else if spectral_profile_is_reliable(profile)
+        && profile.magnitude_profile.is_some()
+        && profile.phase_template.is_some()
+        && profile.phase_consistency.is_some()
+    {
+        spectral_pass_fallback(image, profile, avg_luminance, cfg)
+    } else {
+        spectral_pass_carrier_only(image, profile, cfg.removal_fraction, cfg.consistency_floor)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct StrengthConfig {
     removal_fraction: f32,
     consistency_floor: f32,
-) -> Array3<f32> {
-    // R=0.85, G=1.0, B=0.70 -- Green carries the strongest watermark signal.
-    const CHANNEL_WEIGHTS: [f32; 3] = [0.85, 1.0, 0.70];
-    const SAFETY_CAP: f32 = 0.90;
+    magnitude_cap: f32,
+    dc_radius: f32,
+}
 
+impl StrengthConfig {
+    fn gentle() -> Self {
+        Self {
+            removal_fraction: 0.60,
+            consistency_floor: 0.70,
+            magnitude_cap: 0.50,
+            dc_radius: 30.0,
+        }
+    }
+
+    fn moderate() -> Self {
+        Self {
+            removal_fraction: 0.80,
+            consistency_floor: 0.50,
+            magnitude_cap: 0.70,
+            dc_radius: 25.0,
+        }
+    }
+
+    fn aggressive() -> Self {
+        Self {
+            removal_fraction: 0.95,
+            consistency_floor: 0.30,
+            magnitude_cap: 0.90,
+            dc_radius: 20.0,
+        }
+    }
+}
+
+fn spectral_pass_exact(
+    image: ArrayView3<f32>,
+    profile: &ResolutionProfile,
+    avg_luminance: f32,
+    cfg: StrengthConfig,
+) -> Array3<f32> {
+    let mut result = Array3::<f32>::zeros(image.dim());
+
+    for (ch, &weight) in channel_weights().iter().enumerate() {
+        let channel = image.slice(s![.., .., ch]);
+        let mut fft_data = fft2(channel).data;
+        let wm_est = estimate_watermark_fft(profile, &fft_data, ch, avg_luminance, cfg, weight);
+
+        for ((y, x), value) in fft_data.indexed_iter_mut() {
+            *value -= wm_est[[y, x]];
+        }
+
+        let cleaned = Spectrum { data: fft_data }.to_spatial();
+        result
+            .slice_mut(s![.., .., ch])
+            .assign(&cleaned.mapv(|v| v.clamp(0.0, 1.0)));
+    }
+
+    result
+}
+
+fn spectral_pass_fallback(
+    image: ArrayView3<f32>,
+    profile: &ResolutionProfile,
+    avg_luminance: f32,
+    cfg: StrengthConfig,
+) -> Array3<f32> {
     let h = image.shape()[0];
     let w = image.shape()[1];
     let mut result = Array3::<f32>::zeros((h, w, 3));
 
-    // Build combined carrier list with coherence and reference phase per carrier.
+    for (ch, _) in channel_weights().iter().enumerate() {
+        let wm_native = watermark_spatial(profile, ch, avg_luminance, cfg);
+        let wm_resized = resize_gray(&wm_native, h, w);
+        let cleaned = &image.slice(s![.., .., ch]).to_owned() - &wm_resized;
+        result
+            .slice_mut(s![.., .., ch])
+            .assign(&cleaned.mapv(|v| v.clamp(0.0, 1.0)));
+    }
+
+    result
+}
+
+fn spectral_pass_carrier_only(
+    image: ArrayView3<f32>,
+    profile: &ResolutionProfile,
+    removal_fraction: f32,
+    consistency_floor: f32,
+) -> Array3<f32> {
+    const SAFETY_CAP: f32 = 0.90;
+    let h = image.shape()[0];
+    let w = image.shape()[1];
+    let mut result = Array3::<f32>::zeros((h, w, 3));
+    let size = profile.image_size;
+
     let dark_carriers: Vec<(i32, i32, f32, f32)> = CARRIERS_DARK
         .iter()
         .zip(profile.dark.coherence.iter())
         .zip(profile.dark.ref_phases.iter())
         .map(|((&freq, &coh), &phase)| (freq.0, freq.1, coh, phase))
         .collect();
-
     let white_carriers: Vec<(i32, i32, f32, f32)> = CARRIERS_WHITE
         .iter()
         .zip(profile.white.coherence.iter())
@@ -179,16 +290,9 @@ fn spectral_pass(
         .map(|((&freq, &coh), &phase)| (freq.0, freq.1, coh, phase))
         .collect();
 
-    let size = profile.image_size;
-
-    for (ch, &weight) in CHANNEL_WEIGHTS.iter().enumerate() {
-        let channel = image.slice(s![.., .., ch]);
-
-        // Resize channel to codebook size, subtract in that space, resize back.
-        let channel_owned = channel.to_owned();
-        let resized_ch = crate::fft::resize_gray(&channel_owned, size, size);
-
-        // Forward FFT (unshifted layout for subtraction).
+    for (ch, &weight) in channel_weights().iter().enumerate() {
+        let channel_owned = image.slice(s![.., .., ch]).to_owned();
+        let resized_ch = resize_gray(&channel_owned, size, size);
         let mut fft_data = fft2(resized_ch.view()).data;
 
         for carriers in [dark_carriers.as_slice(), white_carriers.as_slice()] {
@@ -196,41 +300,131 @@ fn spectral_pass(
                 if coherence < consistency_floor {
                     continue;
                 }
-
-                // Map shifted carrier (fy, fx) back to unshifted FFT index.
                 let (uy, ux) = shifted_to_unshifted(fy, fx, size);
                 if uy >= size || ux >= size {
                     continue;
                 }
-
                 let bin = fft_data[[uy, ux]];
                 let img_mag = bin.norm();
                 if img_mag < 1e-10 {
                     continue;
                 }
-
                 let subtract_mag =
                     (img_mag * coherence * removal_fraction * weight).min(SAFETY_CAP * img_mag);
-
                 let subtract = Complex::new(
                     subtract_mag * ref_phase.cos(),
                     subtract_mag * ref_phase.sin(),
                 );
-
                 fft_data[[uy, ux]] -= subtract;
             }
         }
 
-        // Inverse FFT and resize back to original dimensions.
         let cleaned_resized = Spectrum { data: fft_data }.to_spatial();
-        let cleaned = crate::fft::resize_gray(&cleaned_resized, h, w);
-
+        let cleaned = resize_gray(&cleaned_resized, h, w);
         result
             .slice_mut(s![.., .., ch])
             .assign(&cleaned.mapv(|v| v.clamp(0.0, 1.0)));
     }
 
     result
+}
+
+fn estimate_watermark_fft(
+    profile: &ResolutionProfile,
+    image_fft: &ndarray::Array2<Complex<f32>>,
+    channel: usize,
+    avg_luminance: f32,
+    cfg: StrengthConfig,
+    channel_weight: f32,
+) -> ndarray::Array2<Complex<f32>> {
+    let (h, w) = image_fft.dim();
+    let mag = profile
+        .magnitude_profile_array()
+        .expect("checked by caller for spectral profile");
+    let phase = profile
+        .phase_template_array()
+        .expect("checked by caller for spectral profile");
+    let consistency = profile
+        .phase_consistency_array()
+        .expect("checked by caller for spectral profile");
+    let white_mag = profile.white_magnitude_profile_array();
+    let agreement = profile.black_white_agreement_array();
+
+    ndarray::Array2::from_shape_fn((h, w), |(y, x)| {
+        let mut wm_mag = if let Some(white) = &white_mag {
+            mag[[y, x, channel]] * (1.0 - avg_luminance) + white[[y, x, channel]] * avg_luminance
+        } else {
+            mag[[y, x, channel]]
+        };
+
+        if let Some(agree) = &agreement {
+            wm_mag *= agree[[y, x, channel]];
+        }
+
+        let fy = signed_freq(y, h);
+        let fx = signed_freq(x, w);
+        let dc_ramp = ((fy * fy + fx * fx).sqrt() / cfg.dc_radius).clamp(0.0, 1.0);
+        wm_mag *= dc_ramp;
+
+        let consistency_val = consistency[[y, x, channel]];
+        let cons_weight = ((consistency_val - cfg.consistency_floor)
+            / (1.0 - cfg.consistency_floor + 1e-9))
+            .clamp(0.0, 1.0);
+
+        let subtract_mag = (wm_mag * cons_weight * cfg.removal_fraction * channel_weight)
+            .min(image_fft[[y, x]].norm() * cfg.magnitude_cap);
+        let ref_phase = phase[[y, x, channel]];
+        Complex::new(subtract_mag * ref_phase.cos(), subtract_mag * ref_phase.sin())
+    })
+}
+
+fn watermark_spatial(
+    profile: &ResolutionProfile,
+    channel: usize,
+    avg_luminance: f32,
+    cfg: StrengthConfig,
+) -> ndarray::Array2<f32> {
+    let content = profile.content_magnitude_baseline_array();
+    let phase = profile
+        .phase_template_array()
+        .expect("checked by caller for spectral profile");
+    let (h, w, _) = phase.dim();
+
+    let synth_fft = ndarray::Array2::from_shape_fn((h, w), |(y, x)| {
+        let mag = content
+            .as_ref()
+            .map(|baseline| baseline[[y, x, channel]])
+            .unwrap_or_else(|| {
+                profile
+                    .magnitude_profile_array()
+                    .expect("spectral magnitude exists")[[y, x, channel]]
+                    * 10.0
+            });
+        let ref_phase = phase[[y, x, channel]];
+        Complex::new(mag * ref_phase.cos(), mag * ref_phase.sin())
+    });
+
+    let wm_fft = estimate_watermark_fft(profile, &synth_fft, channel, avg_luminance, cfg, channel_weights()[channel]);
+    Spectrum { data: wm_fft }.to_spatial()
+}
+
+fn channel_weights() -> [f32; 3] {
+    [0.85, 1.0, 0.70]
+}
+
+fn spectral_profile_is_reliable(profile: &ResolutionProfile) -> bool {
+    let has_cross_validation = profile.black_white_agreement.is_some();
+    has_cross_validation || profile.n_images >= 8
+}
+
+fn signed_freq(index: usize, len: usize) -> f32 {
+    let idx = index as f32;
+    let half = len as f32 / 2.0;
+    if idx > half {
+        idx - len as f32
+    } else {
+        idx
+    }
 }
 
 // Convert a shifted carrier frequency (fy, fx) to an unshifted FFT bin index.

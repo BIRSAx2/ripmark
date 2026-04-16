@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::carriers::{phase_coherence_at, reference_phases, CARRIERS_DARK, CARRIERS_WHITE};
 use crate::denoise::extract_noise_fused;
-use crate::fft::resize_rgb;
+use crate::fft::{fft2_rgb, resize_rgb};
 
 const MAGIC: &[u8; 8] = b"RIPBOOK\x01";
 
@@ -53,6 +53,24 @@ pub struct ResolutionProfile {
     /// correlation_mean - 2.5 * correlation_std. Images below this are likely
     /// non-watermarked.
     pub detection_threshold: f32,
+    /// Native-resolution average watermark magnitude estimate.
+    /// Flattened from shape (height, width, 3) in row-major order.
+    pub magnitude_profile: Option<Vec<f32>>,
+    /// Native-resolution circular-mean FFT phase template.
+    /// Flattened from shape (height, width, 3) in row-major order.
+    pub phase_template: Option<Vec<f32>>,
+    /// Native-resolution phase consistency in [0, 1].
+    /// Flattened from shape (height, width, 3) in row-major order.
+    pub phase_consistency: Option<Vec<f32>>,
+    /// Native-resolution average content magnitude baseline.
+    /// Flattened from shape (height, width, 3) in row-major order.
+    pub content_magnitude_baseline: Option<Vec<f32>>,
+    /// Optional white-reference magnitude profile.
+    /// Flattened from shape (height, width, 3) in row-major order.
+    pub white_magnitude_profile: Option<Vec<f32>>,
+    /// Optional black/white agreement confidence.
+    /// Flattened from shape (height, width, 3) in row-major order.
+    pub black_white_agreement: Option<Vec<f32>>,
 }
 
 impl ResolutionProfile {
@@ -61,6 +79,41 @@ impl ResolutionProfile {
         let s = self.image_size;
         Array3::from_shape_vec((s, s, 3), self.reference_noise.clone())
             .expect("reference_noise length matches image_size")
+    }
+
+    fn profile_array(
+        data: &Option<Vec<f32>>,
+        height: usize,
+        width: usize,
+    ) -> Option<Array3<f32>> {
+        data.as_ref().map(|values| {
+            Array3::from_shape_vec((height, width, 3), values.clone())
+                .expect("profile array length matches resolution")
+        })
+    }
+
+    pub fn magnitude_profile_array(&self) -> Option<Array3<f32>> {
+        Self::profile_array(&self.magnitude_profile, self.height, self.width)
+    }
+
+    pub fn phase_template_array(&self) -> Option<Array3<f32>> {
+        Self::profile_array(&self.phase_template, self.height, self.width)
+    }
+
+    pub fn phase_consistency_array(&self) -> Option<Array3<f32>> {
+        Self::profile_array(&self.phase_consistency, self.height, self.width)
+    }
+
+    pub fn content_magnitude_baseline_array(&self) -> Option<Array3<f32>> {
+        Self::profile_array(&self.content_magnitude_baseline, self.height, self.width)
+    }
+
+    pub fn white_magnitude_profile_array(&self) -> Option<Array3<f32>> {
+        Self::profile_array(&self.white_magnitude_profile, self.height, self.width)
+    }
+
+    pub fn black_white_agreement_array(&self) -> Option<Array3<f32>> {
+        Self::profile_array(&self.black_white_agreement, self.height, self.width)
     }
 }
 
@@ -135,6 +188,7 @@ impl Codebook {
         }
 
         let (correlation_mean, correlation_std) = mean_std(&correlations);
+        let spectral = build_spectral_profile(images, height, width);
 
         ResolutionProfile {
             height,
@@ -153,6 +207,12 @@ impl Codebook {
             correlation_mean,
             correlation_std,
             detection_threshold: correlation_mean - 2.5 * correlation_std,
+            magnitude_profile: Some(spectral.magnitude_profile),
+            phase_template: Some(spectral.phase_template),
+            phase_consistency: Some(spectral.phase_consistency),
+            content_magnitude_baseline: Some(spectral.content_magnitude_baseline),
+            white_magnitude_profile: None,
+            black_white_agreement: None,
         }
     }
 
@@ -300,8 +360,68 @@ impl From<LegacyCodebook> for Codebook {
                 correlation_mean: value.correlation_mean,
                 correlation_std: value.correlation_std,
                 detection_threshold: value.detection_threshold,
+                magnitude_profile: None,
+                phase_template: None,
+                phase_consistency: None,
+                content_magnitude_baseline: None,
+                white_magnitude_profile: None,
+                black_white_agreement: None,
             }],
         }
+    }
+}
+
+struct SpectralProfileData {
+    magnitude_profile: Vec<f32>,
+    phase_template: Vec<f32>,
+    phase_consistency: Vec<f32>,
+    content_magnitude_baseline: Vec<f32>,
+}
+
+fn build_spectral_profile(images: &[Array3<f32>], height: usize, width: usize) -> SpectralProfileData {
+    let mut mag_sum = Array3::<f64>::zeros((height, width, 3));
+    let mut phase_re = Array3::<f64>::zeros((height, width, 3));
+    let mut phase_im = Array3::<f64>::zeros((height, width, 3));
+
+    for image in images {
+        let spectra = fft2_rgb(image.view());
+        for (ch, spectrum) in spectra.iter().enumerate() {
+            for ((y, x), bin) in spectrum.data.indexed_iter() {
+                let mag = bin.norm() as f64;
+                let phase = bin.arg() as f64;
+                mag_sum[[y, x, ch]] += mag;
+                phase_re[[y, x, ch]] += phase.cos();
+                phase_im[[y, x, ch]] += phase.sin();
+            }
+        }
+    }
+
+    let n = images.len() as f64;
+    let mut magnitude_profile = Vec::with_capacity(height * width * 3);
+    let mut phase_template = Vec::with_capacity(height * width * 3);
+    let mut phase_consistency = Vec::with_capacity(height * width * 3);
+    let mut content_magnitude_baseline = Vec::with_capacity(height * width * 3);
+
+    for y in 0..height {
+        for x in 0..width {
+            for ch in 0..3 {
+                let avg_mag = mag_sum[[y, x, ch]] / n;
+                let re = phase_re[[y, x, ch]] / n;
+                let im = phase_im[[y, x, ch]] / n;
+                let coherence = (re * re + im * im).sqrt() as f32;
+                magnitude_profile.push((avg_mag as f32) * coherence * coherence);
+                phase_template.push(im.atan2(re) as f32);
+                phase_consistency.push(coherence);
+                content_magnitude_baseline.push(avg_mag as f32);
+            }
+        }
+    }
+
+    SpectralProfileData {
+        magnitude_profile,
+        phase_template,
+        phase_consistency,
+        content_magnitude_baseline,
     }
 }
 
@@ -401,13 +521,14 @@ mod tests {
 
     #[test]
     fn best_profile_prefers_exact_resolution() {
-        let images = dummy_images(3, 32, 32);
+        let images_a = dummy_images(3, 512, 512);
+        let images_b = dummy_images(3, 768, 1024);
         let mut cb = Codebook {
             version: 2,
             source: "exact-match".into(),
-            profiles: vec![Codebook::build_profile(&images, 512, 512, 32)],
+            profiles: vec![Codebook::build_profile(&images_a, 512, 512, 32)],
         };
-        cb.add_profile(Codebook::build_profile(&images, 768, 1024, 32));
+        cb.add_profile(Codebook::build_profile(&images_b, 768, 1024, 32));
 
         let (profile, exact) = cb.best_profile(768, 1024).unwrap();
         assert!(exact);
@@ -416,13 +537,14 @@ mod tests {
 
     #[test]
     fn best_profile_falls_back_to_closest_aspect_ratio() {
-        let images = dummy_images(3, 32, 32);
+        let images_a = dummy_images(3, 512, 512);
+        let images_b = dummy_images(3, 768, 1024);
         let mut cb = Codebook {
             version: 2,
             source: "fallback-match".into(),
-            profiles: vec![Codebook::build_profile(&images, 512, 512, 32)],
+            profiles: vec![Codebook::build_profile(&images_a, 512, 512, 32)],
         };
-        cb.add_profile(Codebook::build_profile(&images, 768, 1024, 32));
+        cb.add_profile(Codebook::build_profile(&images_b, 768, 1024, 32));
 
         let (profile, exact) = cb.best_profile(720, 960).unwrap();
         assert!(!exact);
